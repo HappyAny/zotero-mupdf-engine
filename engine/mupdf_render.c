@@ -484,28 +484,65 @@ static fz_device *new_theme_filter_device(fz_context *ctx, fz_device *inner, con
 }
 
 static void apply_pixel_theme(unsigned char *rgba, size_t npixels, const ZotTheme *theme) {
-    float bg_r = theme->bg[0] / 255.0f;
-    float bg_g = theme->bg[1] / 255.0f;
-    float bg_b = theme->bg[2] / 255.0f;
-    float fg_r = theme->fg[0] / 255.0f;
-    float fg_g = theme->fg[1] / 255.0f;
-    float fg_b = theme->fg[2] / 255.0f;
+    const float inv255 = 1.0f / 255.0f;
+    float bg_r = theme->bg[0] * inv255;
+    float bg_g = theme->bg[1] * inv255;
+    float bg_b = theme->bg[2] * inv255;
+    float fg_r = theme->fg[0] * inv255;
+    float fg_g = theme->fg[1] * inv255;
+    float fg_b = theme->fg[2] * inv255;
     float bg_lum = 0.2126f * bg_r + 0.7152f * bg_g + 0.0722f * bg_b;
     float fg_lum = 0.2126f * fg_r + 0.7152f * fg_g + 0.0722f * fg_b;
     int is_dark = bg_lum < fg_lum ? 1 : 0;
+    float span_r = bg_r - fg_r;
+    float span_g = bg_g - fg_g;
+    float span_b = bg_b - fg_b;
+    float chroma_scale = is_dark ? 0.92f : 0.95f;
 
+    // 256-entry L1-resident RGBA LUT for neutral/grayscale pixels (95%+ of PDF pages: paper, text, AA edges!)
+    uint32_t gray_lut[256];
+    for (int g = 0; g < 256; g++) {
+        float lum = g * inv255;
+        uint32_t or_ = (uint32_t)(clamp01(fg_r + lum * span_r) * 255.0f + 0.5f);
+        uint32_t og_ = (uint32_t)(clamp01(fg_g + lum * span_g) * 255.0f + 0.5f);
+        uint32_t ob_ = (uint32_t)(clamp01(fg_b + lum * span_b) * 255.0f + 0.5f);
+        gray_lut[g] = or_ | (og_ << 8) | (ob_ << 16) | 0xFF000000u;
+    }
+
+    uint32_t *px32 = (uint32_t *)rgba;
     for (size_t i = 0; i < npixels; i++) {
-        unsigned char *p = rgba + i * 4;
-        float or_, og_, ob_;
-        remap_rgb_float(
-            p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f,
-            bg_r, bg_g, bg_b, fg_r, fg_g, fg_b, is_dark,
-            &or_, &og_, &ob_
-        );
-        p[0] = (unsigned char)(or_ * 255.0f + 0.5f);
-        p[1] = (unsigned char)(og_ * 255.0f + 0.5f);
-        p[2] = (unsigned char)(ob_ * 255.0f + 0.5f);
-        p[3] = 255;
+        uint32_t v = px32[i];
+        unsigned r = v & 0xFFu;
+        unsigned g = (v >> 8) & 0xFFu;
+        unsigned b = (v >> 16) & 0xFFu;
+
+        // Ultra-fast exact gray path: single L1 table lookup, zero float ops!
+        if (r == g && g == b) {
+            px32[i] = gray_lut[r];
+            continue;
+        }
+
+        unsigned maxc = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        unsigned minc = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if (maxc - minc <= 5u) {
+            // Matches remap_rgb_float sat < 0.02f threshold using integer BT.709 luminance
+            unsigned lum8 = (54u * r + 183u * g + 19u * b + 128u) >> 8;
+            if (lum8 > 255u) lum8 = 255u;
+            px32[i] = gray_lut[lum8];
+            continue;
+        }
+
+        float rf = r * inv255;
+        float gf = g * inv255;
+        float bf = b * inv255;
+        float lum = 0.2126f * rf + 0.7152f * gf + 0.0722f * bf;
+        float base_r = fg_r + lum * span_r;
+        float base_g = fg_g + lum * span_g;
+        float base_b = fg_b + lum * span_b;
+        uint32_t or_ = (uint32_t)(clamp01(base_r + (rf - lum) * chroma_scale) * 255.0f + 0.5f);
+        uint32_t og_ = (uint32_t)(clamp01(base_g + (gf - lum) * chroma_scale) * 255.0f + 0.5f);
+        uint32_t ob_ = (uint32_t)(clamp01(base_b + (bf - lum) * chroma_scale) * 255.0f + 0.5f);
+        px32[i] = or_ | (og_ << 8) | (ob_ << 16) | 0xFF000000u;
     }
 }
 

@@ -2,11 +2,114 @@
 #include "../engine/mupdf_render.h"
 
 #include <math.h>
-#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <process.h>
 #include <windows.h>
+
+typedef SRWLOCK zot_rwlock_t;
+#define ZOT_RWLOCK_INIT SRWLOCK_INIT
+static inline void zot_rwlock_init(zot_rwlock_t *l) { InitializeSRWLock(l); }
+static inline void zot_rwlock_destroy(zot_rwlock_t *l) { (void)l; }
+static inline void zot_rwlock_rdlock(zot_rwlock_t *l) { AcquireSRWLockShared(l); }
+static inline void zot_rwlock_rdunlock(zot_rwlock_t *l) { ReleaseSRWLockShared(l); }
+static inline void zot_rwlock_wrlock(zot_rwlock_t *l) { AcquireSRWLockExclusive(l); }
+static inline void zot_rwlock_wrunlock(zot_rwlock_t *l) { ReleaseSRWLockExclusive(l); }
+
+typedef CRITICAL_SECTION zot_mutex_t;
+typedef CONDITION_VARIABLE zot_cond_t;
+static inline void zot_mutex_init(zot_mutex_t *m) { InitializeCriticalSection(m); }
+static inline void zot_mutex_destroy(zot_mutex_t *m) { DeleteCriticalSection(m); }
+static inline void zot_mutex_lock(zot_mutex_t *m) { EnterCriticalSection(m); }
+static inline void zot_mutex_unlock(zot_mutex_t *m) { LeaveCriticalSection(m); }
+static inline void zot_cond_init(zot_cond_t *c) { InitializeConditionVariable(c); }
+static inline void zot_cond_destroy(zot_cond_t *c) { (void)c; }
+static inline void zot_cond_broadcast(zot_cond_t *c) { WakeAllConditionVariable(c); }
+/* Returns 1 if signaled/spurious, 0 if timed out. timeout_ms < 0 waits infinitely. */
+static inline int zot_cond_wait_ms(zot_cond_t *c, zot_mutex_t *m, int timeout_ms) {
+    DWORD ms = timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms;
+    BOOL ok = SleepConditionVariableCS(c, m, ms);
+    if (!ok && GetLastError() == ERROR_TIMEOUT) return 0;
+    return 1;
+}
+
+typedef volatile LONG64 zot_atomic64_t;
+typedef volatile LONG zot_atomic32_t;
+static inline int64_t zot_atomic64_load(zot_atomic64_t *p) { return (int64_t)InterlockedCompareExchange64(p, 0, 0); }
+static inline int64_t zot_atomic64_inc(zot_atomic64_t *p) { return (int64_t)InterlockedIncrement64(p); }
+static inline int32_t zot_atomic32_load(zot_atomic32_t *p) { return (int32_t)InterlockedCompareExchange(p, 0, 0); }
+static inline int32_t zot_atomic32_inc(zot_atomic32_t *p) { return (int32_t)InterlockedIncrement(p); }
+static inline int32_t zot_atomic32_dec(zot_atomic32_t *p) { return (int32_t)InterlockedDecrement(p); }
+
+typedef HANDLE zot_thread_t;
+#define ZOT_THREAD_RET unsigned __stdcall
+#define ZOT_THREAD_RETURN return 0
+static inline void zot_set_bg_priority(void) { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST); }
+static inline void zot_thread_yield(void) { SwitchToThread(); }
+#else
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef pthread_rwlock_t zot_rwlock_t;
+#define ZOT_RWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
+static inline void zot_rwlock_init(zot_rwlock_t *l) { pthread_rwlock_init(l, NULL); }
+static inline void zot_rwlock_destroy(zot_rwlock_t *l) { pthread_rwlock_destroy(l); }
+static inline void zot_rwlock_rdlock(zot_rwlock_t *l) { pthread_rwlock_rdlock(l); }
+static inline void zot_rwlock_rdunlock(zot_rwlock_t *l) { pthread_rwlock_unlock(l); }
+static inline void zot_rwlock_wrlock(zot_rwlock_t *l) { pthread_rwlock_wrlock(l); }
+static inline void zot_rwlock_wrunlock(zot_rwlock_t *l) { pthread_rwlock_unlock(l); }
+
+typedef pthread_mutex_t zot_mutex_t;
+typedef pthread_cond_t zot_cond_t;
+static inline void zot_mutex_init(zot_mutex_t *m) { pthread_mutex_init(m, NULL); }
+static inline void zot_mutex_destroy(zot_mutex_t *m) { pthread_mutex_destroy(m); }
+static inline void zot_mutex_lock(zot_mutex_t *m) { pthread_mutex_lock(m); }
+static inline void zot_mutex_unlock(zot_mutex_t *m) { pthread_mutex_unlock(m); }
+static inline void zot_cond_init(zot_cond_t *c) { pthread_cond_init(c, NULL); }
+static inline void zot_cond_destroy(zot_cond_t *c) { pthread_cond_destroy(c); }
+static inline void zot_cond_broadcast(zot_cond_t *c) { pthread_cond_broadcast(c); }
+static inline int zot_cond_wait_ms(zot_cond_t *c, zot_mutex_t *m, int timeout_ms) {
+    if (timeout_ms < 0) {
+        pthread_cond_wait(c, m);
+        return 1;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000L;
+    }
+    int rc = pthread_cond_timedwait(c, m, &ts);
+    return (rc == ETIMEDOUT) ? 0 : 1;
+}
+
+typedef volatile int64_t zot_atomic64_t;
+typedef volatile int32_t zot_atomic32_t;
+static inline int64_t zot_atomic64_load(zot_atomic64_t *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static inline int64_t zot_atomic64_inc(zot_atomic64_t *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static inline int32_t zot_atomic32_load(zot_atomic32_t *p) { return __atomic_load_n(p, __ATOMIC_SEQ_CST); }
+static inline int32_t zot_atomic32_inc(zot_atomic32_t *p) { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+static inline int32_t zot_atomic32_dec(zot_atomic32_t *p) { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
+
+typedef pthread_t zot_thread_t;
+#define ZOT_THREAD_RET void *
+#define ZOT_THREAD_RETURN return NULL
+static inline void zot_set_bg_priority(void) {
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#endif
+}
+static inline void zot_thread_yield(void) { sched_yield(); }
+#endif
 
 #define MAX_WORKER_DOCS 2
 #define MAX_DLS 24
@@ -31,7 +134,7 @@ typedef struct {
     WorkerDocSlot slots[MAX_WORKER_DOCS];
     int count;
     uint64_t clock;
-    LONG64 last_evict_gen;
+    int64_t last_evict_gen;
 } WorkerDocCache;
 
 typedef struct {
@@ -103,15 +206,15 @@ typedef struct {
     fz_context *base_ctx;
     void *base_locks;
 
-    SRWLOCK cache_lock;
+    zot_rwlock_t cache_lock;
     uint64_t clock;
     DLEntry *dls[MAX_DLS];
     int dl_count;
 
-    volatile LONG64 evict_gen;
-    volatile LONG fg_active;
+    zot_atomic64_t evict_gen;
+    zot_atomic32_t fg_active;
 
-    SRWLOCK pix_lock;
+    zot_rwlock_t pix_lock;
     PixEntry *pix_head; // MRU
     PixEntry *pix_tail; // LRU
     size_t pix_bytes;
@@ -119,18 +222,18 @@ typedef struct {
     PixRecycledBuf pix_recycle[MAX_PIX_RECYCLE];
     int pix_recycle_count;
 
-    SRWLOCK cookie_lock;
+    zot_rwlock_t cookie_lock;
     ActiveCookie cookies[MAX_ACTIVE_COOKIES];
 
-    CRITICAL_SECTION bg_cs;
-    CONDITION_VARIABLE bg_cv;
+    zot_mutex_t bg_cs;
+    zot_cond_t bg_cv;
     BgJob bg_queue[BG_QUEUE_CAP]; // index 0..bg_count-1; index 0 is highest priority!
     int bg_count;
     int bg_stop;
     char *last_fg_path;
     int last_fg_page;
     int last_fg_dir; // +1 = scrolling down, -1 = scrolling up
-    HANDLE *bg_threads;
+    zot_thread_t *bg_threads;
     int bg_thread_count;
 } ZotEngine;
 
@@ -139,11 +242,12 @@ typedef struct {
     WorkerDocCache doc_cache;
 } ZotWorker;
 
-static SRWLOCK g_singleton_lock = SRWLOCK_INIT;
+static zot_rwlock_t g_singleton_lock = ZOT_RWLOCK_INIT;
 static ZotEngine *g_engine = NULL;
 static int g_engine_refs = 0;
 
 static double now_ms(void) {
+#ifdef _WIN32
     static LARGE_INTEGER freq = {0};
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);
@@ -151,6 +255,11 @@ static double now_ms(void) {
     LARGE_INTEGER cnt;
     QueryPerformanceCounter(&cnt);
     return (double)cnt.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
 }
 
 static char *dup_str(const char *s) {
@@ -162,6 +271,7 @@ static char *dup_str(const char *s) {
 }
 
 static int stat_utf8(const char *path_utf8, int64_t *out_mtime, int64_t *out_size) {
+#ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path_utf8, -1, NULL, 0);
     if (wlen <= 0) return -1;
     wchar_t *wpath = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
@@ -181,6 +291,17 @@ static int stat_utf8(const char *path_utf8, int64_t *out_mtime, int64_t *out_siz
     *out_size = (int64_t)sz.QuadPart;
     *out_mtime = (int64_t)mt.QuadPart;
     return 0;
+#else
+    struct stat st;
+    if (stat(path_utf8, &st) != 0) return -1;
+    *out_size = (int64_t)st.st_size;
+#if defined(__APPLE__)
+    *out_mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + (int64_t)st.st_mtimespec.tv_nsec;
+#else
+    *out_mtime = (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+#endif
+    return 0;
+#endif
 }
 
 static void quantize_m(const float m[6], int32_t qm[6]) {
@@ -239,7 +360,7 @@ static fz_document *worker_doc_get(
     char *err_buf,
     int err_cap
 ) {
-    LONG64 cur_gen = InterlockedCompareExchange64(&eng->evict_gen, 0, 0);
+    int64_t cur_gen = zot_atomic64_load(&eng->evict_gen);
     if (dc->last_evict_gen != cur_gen) {
         worker_doc_cache_clear(wctx, dc);
         dc->last_evict_gen = cur_gen;
@@ -294,7 +415,7 @@ static fz_document *worker_doc_get(
 
 static unsigned char *pix_alloc_buf(ZotEngine *eng, size_t byte_len) {
     unsigned char *reused = NULL;
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     for (int i = eng->pix_recycle_count - 1; i >= 0; i--) {
         if (eng->pix_recycle[i].byte_len == byte_len) {
             reused = eng->pix_recycle[i].ptr;
@@ -302,7 +423,7 @@ static unsigned char *pix_alloc_buf(ZotEngine *eng, size_t byte_len) {
             break;
         }
     }
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
     if (reused) return reused;
     return (unsigned char *)malloc(byte_len);
 }
@@ -327,9 +448,9 @@ static void pix_recycle_buf_locked(ZotEngine *eng, unsigned char *ptr, size_t by
 
 static void pix_release_buf(ZotEngine *eng, unsigned char *ptr, size_t byte_len) {
     if (!ptr) return;
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     pix_recycle_buf_locked(eng, ptr, byte_len);
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
 }
 
 static void free_pix_entry_meta(PixEntry *e) {
@@ -370,16 +491,16 @@ static void pix_push_back(ZotEngine *eng, PixEntry *e) {
 }
 
 static int pix_exists(ZotEngine *eng, const PixKey *k) {
-    AcquireSRWLockShared(&eng->pix_lock);
+    zot_rwlock_rdlock(&eng->pix_lock);
     PixEntry *cur = eng->pix_head;
     while (cur) {
         if (pix_key_eq(&cur->key, k)) {
-            ReleaseSRWLockShared(&eng->pix_lock);
+            zot_rwlock_rdunlock(&eng->pix_lock);
             return 1;
         }
         cur = cur->next;
     }
-    ReleaseSRWLockShared(&eng->pix_lock);
+    zot_rwlock_rdunlock(&eng->pix_lock);
     return 0;
 }
 
@@ -391,7 +512,7 @@ static int pix_lookup_copy(
     float *out_ph,
     int *out_page_count
 ) {
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     PixEntry *cur = eng->pix_head;
     while (cur) {
         if (pix_key_eq(&cur->key, k)) {
@@ -407,12 +528,12 @@ static int pix_lookup_copy(
             if (out_pw) *out_pw = cur->page_w;
             if (out_ph) *out_ph = cur->page_h;
             if (out_page_count) *out_page_count = cur->page_count;
-            ReleaseSRWLockExclusive(&eng->pix_lock);
+            zot_rwlock_wrunlock(&eng->pix_lock);
             return 1;
         }
         cur = cur->next;
     }
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
     return 0;
 }
 
@@ -431,7 +552,7 @@ static void pix_store_take(
         return;
     }
 
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     PixEntry *cur = eng->pix_head;
     while (cur) {
         if (pix_key_eq(&cur->key, k)) {
@@ -447,7 +568,7 @@ static void pix_store_take(
                 pix_unlink(eng, cur);
                 pix_push_front(eng, cur);
             }
-            ReleaseSRWLockExclusive(&eng->pix_lock);
+            zot_rwlock_wrunlock(&eng->pix_lock);
             return;
         }
         cur = cur->next;
@@ -456,7 +577,7 @@ static void pix_store_take(
     PixEntry *e = (PixEntry *)calloc(1, sizeof(PixEntry));
     if (!e) {
         pix_recycle_buf_locked(eng, owned_rgba, byte_len);
-        ReleaseSRWLockExclusive(&eng->pix_lock);
+        zot_rwlock_wrunlock(&eng->pix_lock);
         return;
     }
     e->key = *k;
@@ -478,7 +599,7 @@ static void pix_store_take(
         ev->rgba = NULL;
         free_pix_entry_meta(ev);
     }
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
 }
 
 /* ---------------- Shared Display List LRU Cache (Self-Contained) ---------------- */
@@ -514,7 +635,7 @@ static DLEntry *acquire_dl(
     *out_dl_hit = 0;
     if (out_aborted) *out_aborted = 0;
 
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     for (int i = 0; i < eng->dl_count; i++) {
         DLEntry *e = eng->dls[i];
         if (e->page_index == page_index && e->include_annots == include_annots &&
@@ -524,11 +645,11 @@ static DLEntry *acquire_dl(
             e->refs++;
             *out_dl_hit = 1;
             if (out_page_count) *out_page_count = e->page_count;
-            ReleaseSRWLockExclusive(&eng->cache_lock);
+            zot_rwlock_wrunlock(&eng->cache_lock);
             return e;
         }
     }
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
 
     if (cookie && cookie->abort) {
         if (out_aborted) *out_aborted = 1;
@@ -560,7 +681,7 @@ static DLEntry *acquire_dl(
 
     DLEntry *ev_dl = NULL;
 
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     for (int i = 0; i < eng->dl_count; i++) {
         DLEntry *e = eng->dls[i];
         if (e->page_index == page_index && e->include_annots == include_annots &&
@@ -569,7 +690,7 @@ static DLEntry *acquire_dl(
             e->last_used = ++eng->clock;
             e->refs++;
             *out_dl_hit = 1;
-            ReleaseSRWLockExclusive(&eng->cache_lock);
+            zot_rwlock_wrunlock(&eng->cache_lock);
             zot_drop_display_list(wctx, dl);
             return e;
         }
@@ -601,7 +722,7 @@ static DLEntry *acquire_dl(
     ne->last_used = ++eng->clock;
     ne->in_cache = 1;
     eng->dls[eng->dl_count++] = ne;
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
 
     if (ev_dl) {
         drop_dl_unlocked(wctx, ev_dl);
@@ -611,10 +732,10 @@ static DLEntry *acquire_dl(
 
 static void release_dl(ZotEngine *eng, fz_context *wctx, DLEntry *dl) {
     DLEntry *to_drop_dl = NULL;
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     dl->refs--;
     if (dl->refs <= 0) to_drop_dl = dl;
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
     if (to_drop_dl) {
         drop_dl_unlocked(wctx, to_drop_dl);
     }
@@ -624,7 +745,7 @@ static void release_dl(ZotEngine *eng, fz_context *wctx, DLEntry *dl) {
 
 static void register_cookie(ZotEngine *eng, int req_id, fz_cookie *c) {
     if (req_id <= 0) return;
-    AcquireSRWLockExclusive(&eng->cookie_lock);
+    zot_rwlock_wrlock(&eng->cookie_lock);
     for (int i = 0; i < MAX_ACTIVE_COOKIES; i++) {
         if (eng->cookies[i].cookie == NULL) {
             eng->cookies[i].req_id = req_id;
@@ -632,11 +753,11 @@ static void register_cookie(ZotEngine *eng, int req_id, fz_cookie *c) {
             break;
         }
     }
-    ReleaseSRWLockExclusive(&eng->cookie_lock);
+    zot_rwlock_wrunlock(&eng->cookie_lock);
 }
 
 static void unregister_cookie(ZotEngine *eng, fz_cookie *c) {
-    AcquireSRWLockExclusive(&eng->cookie_lock);
+    zot_rwlock_wrlock(&eng->cookie_lock);
     for (int i = 0; i < MAX_ACTIVE_COOKIES; i++) {
         if (eng->cookies[i].cookie == c) {
             eng->cookies[i].req_id = 0;
@@ -644,7 +765,7 @@ static void unregister_cookie(ZotEngine *eng, fz_cookie *c) {
             break;
         }
     }
-    ReleaseSRWLockExclusive(&eng->cookie_lock);
+    zot_rwlock_wrunlock(&eng->cookie_lock);
 }
 
 /* ---------------- Direction-Aware LIFO Foreground-Yielding Pre-Renderer ---------------- */
@@ -678,9 +799,9 @@ static void schedule_bg_prerenders(
     if (width < 650 && height < 650) return;
     if (fabsf(m[4]) > 8.0f && fabsf(m[5]) > 8.0f) return;
 
-    EnterCriticalSection(&eng->bg_cs);
+    zot_mutex_lock(&eng->bg_cs);
     if (eng->bg_stop) {
-        LeaveCriticalSection(&eng->bg_cs);
+        zot_mutex_unlock(&eng->bg_cs);
         return;
     }
 
@@ -775,18 +896,18 @@ static void schedule_bg_prerenders(
         woke = 1;
     }
     if (woke) {
-        WakeAllConditionVariable(&eng->bg_cv);
+        zot_cond_broadcast(&eng->bg_cv);
     }
-    LeaveCriticalSection(&eng->bg_cs);
+    zot_mutex_unlock(&eng->bg_cs);
 }
 
-static unsigned __stdcall bg_worker_proc(void *arg) {
+static ZOT_THREAD_RET bg_worker_proc(void *arg) {
     ZotEngine *eng = (ZotEngine *)arg;
     // Lowest priority guarantees background pre-rendering NEVER starves Zotero UI, WebRender, or PDF.js!
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+    zot_set_bg_priority();
 
     fz_context *wctx = zot_clone_context(eng->base_ctx);
-    if (!wctx) return 0;
+    if (!wctx) ZOT_THREAD_RETURN;
 
     WorkerDocCache local_docs;
     memset(&local_docs, 0, sizeof(local_docs));
@@ -794,28 +915,28 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
     for (;;) {
         BgJob job;
         int should_clear_docs = 0;
-        EnterCriticalSection(&eng->bg_cs);
-        while (!eng->bg_stop && (eng->bg_count == 0 || InterlockedCompareExchange(&eng->fg_active, 0, 0) > 0)) {
-            LONG64 cur_gen = InterlockedCompareExchange64(&eng->evict_gen, 0, 0);
+        zot_mutex_lock(&eng->bg_cs);
+        while (!eng->bg_stop && (eng->bg_count == 0 || zot_atomic32_load(&eng->fg_active) > 0)) {
+            int64_t cur_gen = zot_atomic64_load(&eng->evict_gen);
             if (local_docs.count > 0 && local_docs.last_evict_gen != cur_gen) {
                 should_clear_docs = 1;
                 break;
             }
-            DWORD timeout = eng->bg_count == 0 ? (local_docs.count > 0 ? 15000 : INFINITE) : 35;
-            BOOL ok = SleepConditionVariableCS(&eng->bg_cv, &eng->bg_cs, timeout);
-            if (!ok && GetLastError() == ERROR_TIMEOUT && eng->bg_count == 0 && local_docs.count > 0) {
+            int timeout = eng->bg_count == 0 ? (local_docs.count > 0 ? 15000 : -1) : 35;
+            int signaled = zot_cond_wait_ms(&eng->bg_cv, &eng->bg_cs, timeout);
+            if (!signaled && eng->bg_count == 0 && local_docs.count > 0) {
                 should_clear_docs = 1;
                 break;
             }
         }
         if (eng->bg_stop) {
-            LeaveCriticalSection(&eng->bg_cs);
+            zot_mutex_unlock(&eng->bg_cs);
             break;
         }
         if (should_clear_docs) {
-            LeaveCriticalSection(&eng->bg_cs);
+            zot_mutex_unlock(&eng->bg_cs);
             worker_doc_cache_clear(wctx, &local_docs);
-            local_docs.last_evict_gen = InterlockedCompareExchange64(&eng->evict_gen, 0, 0);
+            local_docs.last_evict_gen = zot_atomic64_load(&eng->evict_gen);
             continue;
         }
         // Pop highest-priority job from index 0
@@ -824,7 +945,7 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
         if (eng->bg_count > 0) {
             memmove(&eng->bg_queue[0], &eng->bg_queue[1], (size_t)eng->bg_count * sizeof(BgJob));
         }
-        LeaveCriticalSection(&eng->bg_cs);
+        zot_mutex_unlock(&eng->bg_cs);
 
         int64_t mtime = 0, fsize = 0;
         if (stat_utf8(job.path, &mtime, &fsize) == 0) {
@@ -857,8 +978,8 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
                     // (the parsed Display List still stays cached in eng->dls for instant rendering!)
                     int same_dims = (job.src_pw <= 0.0f || job.src_ph <= 0.0f) ||
                                     (fabsf(pw - job.src_pw) <= 2.5f && fabsf(ph - job.src_ph) <= 2.5f);
-                    if (InterlockedCompareExchange(&eng->fg_active, 0, 0) > 0) {
-                        SwitchToThread();
+                    if (zot_atomic32_load(&eng->fg_active) > 0) {
+                        zot_thread_yield();
                     }
                     if (same_dims && !eng->bg_stop && !pix_exists(eng, &pk)) {
                         size_t nbytes = (size_t)job.width * (size_t)job.height * 4;
@@ -886,7 +1007,7 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
 
     worker_doc_cache_clear(wctx, &local_docs);
     zot_drop_cloned_context(wctx);
-    return 0;
+    ZOT_THREAD_RETURN;
 }
 
 /* ---------------- Engine Lifecycle ---------------- */
@@ -906,22 +1027,29 @@ static ZotEngine *create_engine_internal(int store_mb, int pix_cache_mb, int bg_
         return NULL;
     }
 
-    InitializeSRWLock(&eng->cache_lock);
-    InitializeSRWLock(&eng->pix_lock);
-    InitializeSRWLock(&eng->cookie_lock);
-    InitializeCriticalSection(&eng->bg_cs);
-    InitializeConditionVariable(&eng->bg_cv);
+    zot_rwlock_init(&eng->cache_lock);
+    zot_rwlock_init(&eng->pix_lock);
+    zot_rwlock_init(&eng->cookie_lock);
+    zot_mutex_init(&eng->bg_cs);
+    zot_cond_init(&eng->bg_cv);
     eng->max_pix_bytes = (size_t)pix_cache_mb << 20;
     eng->last_fg_dir = 1;
 
     if (bg_workers > 0) {
-        eng->bg_threads = (HANDLE *)calloc((size_t)bg_workers, sizeof(HANDLE));
+        eng->bg_threads = (zot_thread_t *)calloc((size_t)bg_workers, sizeof(zot_thread_t));
         if (eng->bg_threads) {
             for (int i = 0; i < bg_workers; i++) {
+#ifdef _WIN32
                 uintptr_t th = _beginthreadex(NULL, 0, bg_worker_proc, eng, 0, NULL);
                 if (th != 0) {
                     eng->bg_threads[eng->bg_thread_count++] = (HANDLE)th;
                 }
+#else
+                pthread_t th;
+                if (pthread_create(&th, NULL, bg_worker_proc, eng) == 0) {
+                    eng->bg_threads[eng->bg_thread_count++] = th;
+                }
+#endif
             }
         }
     }
@@ -931,7 +1059,7 @@ static ZotEngine *create_engine_internal(int store_mb, int pix_cache_mb, int bg_
 static void destroy_engine_internal(ZotEngine *eng) {
     if (!eng) return;
 
-    EnterCriticalSection(&eng->bg_cs);
+    zot_mutex_lock(&eng->bg_cs);
     eng->bg_stop = 1;
     for (int i = 0; i < eng->bg_count; i++) {
         free_bg_job(&eng->bg_queue[i]);
@@ -939,15 +1067,23 @@ static void destroy_engine_internal(ZotEngine *eng) {
     eng->bg_count = 0;
     free(eng->last_fg_path);
     eng->last_fg_path = NULL;
-    WakeAllConditionVariable(&eng->bg_cv);
-    LeaveCriticalSection(&eng->bg_cs);
+    zot_cond_broadcast(&eng->bg_cv);
+    zot_mutex_unlock(&eng->bg_cs);
 
     for (int i = 0; i < eng->bg_thread_count; i++) {
+#ifdef _WIN32
         WaitForSingleObject(eng->bg_threads[i], 3000);
         CloseHandle(eng->bg_threads[i]);
+#else
+        pthread_join(eng->bg_threads[i], NULL);
+#endif
     }
     free(eng->bg_threads);
-    DeleteCriticalSection(&eng->bg_cs);
+    zot_cond_destroy(&eng->bg_cv);
+    zot_mutex_destroy(&eng->bg_cs);
+    zot_rwlock_destroy(&eng->cookie_lock);
+    zot_rwlock_destroy(&eng->pix_lock);
+    zot_rwlock_destroy(&eng->cache_lock);
 
     PixEntry *pe = eng->pix_head;
     while (pe) {
@@ -974,7 +1110,7 @@ ZOT_EXPORT const char *zot_dll_version(void) {
 }
 
 ZOT_EXPORT void *zot_dll_engine_acquire(int store_mb, int pix_cache_mb, int bg_workers) {
-    AcquireSRWLockExclusive(&g_singleton_lock);
+    zot_rwlock_wrlock(&g_singleton_lock);
     if (!g_engine) {
         g_engine = create_engine_internal(store_mb, pix_cache_mb, bg_workers);
     }
@@ -982,13 +1118,13 @@ ZOT_EXPORT void *zot_dll_engine_acquire(int store_mb, int pix_cache_mb, int bg_w
         g_engine_refs++;
     }
     void *ret = g_engine;
-    ReleaseSRWLockExclusive(&g_singleton_lock);
+    zot_rwlock_wrunlock(&g_singleton_lock);
     return ret;
 }
 
 ZOT_EXPORT void zot_dll_engine_release(void *eng) {
     ZotEngine *to_destroy = NULL;
-    AcquireSRWLockExclusive(&g_singleton_lock);
+    zot_rwlock_wrlock(&g_singleton_lock);
     if (eng && eng == g_engine) {
         g_engine_refs--;
         if (g_engine_refs <= 0) {
@@ -997,7 +1133,7 @@ ZOT_EXPORT void zot_dll_engine_release(void *eng) {
             g_engine_refs = 0;
         }
     }
-    ReleaseSRWLockExclusive(&g_singleton_lock);
+    zot_rwlock_wrunlock(&g_singleton_lock);
     if (to_destroy) {
         destroy_engine_internal(to_destroy);
     }
@@ -1007,18 +1143,18 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
     ZotEngine *eng = (ZotEngine *)eng_ptr;
     if (!eng) return;
 
-    EnterCriticalSection(&eng->bg_cs);
+    zot_mutex_lock(&eng->bg_cs);
     for (int i = 0; i < eng->bg_count; i++) {
         free_bg_job(&eng->bg_queue[i]);
     }
     eng->bg_count = 0;
     free(eng->last_fg_path);
     eng->last_fg_path = NULL;
-    InterlockedIncrement64(&eng->evict_gen);
-    WakeAllConditionVariable(&eng->bg_cv);
-    LeaveCriticalSection(&eng->bg_cs);
+    zot_atomic64_inc(&eng->evict_gen);
+    zot_cond_broadcast(&eng->bg_cv);
+    zot_mutex_unlock(&eng->bg_cs);
 
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     PixEntry *pe = eng->pix_head;
     eng->pix_head = eng->pix_tail = NULL;
     eng->pix_bytes = 0;
@@ -1026,7 +1162,7 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
         free(eng->pix_recycle[i].ptr);
     }
     eng->pix_recycle_count = 0;
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
     while (pe) {
         PixEntry *next = pe->next;
         free_pix_entry(pe);
@@ -1039,7 +1175,7 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
     DLEntry *drop_dls[MAX_DLS];
     int n_dls = 0;
 
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     for (int i = 0; i < eng->dl_count; i++) {
         DLEntry *e = eng->dls[i];
         e->in_cache = 0;
@@ -1047,7 +1183,7 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
         if (e->refs <= 0) drop_dls[n_dls++] = e;
     }
     eng->dl_count = 0;
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
 
     for (int i = 0; i < n_dls; i++) {
         drop_dl_unlocked(tmp, drop_dls[i]);
@@ -1060,7 +1196,7 @@ ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) 
     ZotEngine *eng = (ZotEngine *)eng_ptr;
     if (!eng || !path_utf8 || !path_utf8[0]) return;
 
-    EnterCriticalSection(&eng->bg_cs);
+    zot_mutex_lock(&eng->bg_cs);
     int widx = 0;
     for (int i = 0; i < eng->bg_count; i++) {
         if (strcmp(eng->bg_queue[i].path, path_utf8) == 0) {
@@ -1075,12 +1211,12 @@ ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) 
         free(eng->last_fg_path);
         eng->last_fg_path = NULL;
     }
-    InterlockedIncrement64(&eng->evict_gen);
-    WakeAllConditionVariable(&eng->bg_cv);
-    LeaveCriticalSection(&eng->bg_cs);
+    zot_atomic64_inc(&eng->evict_gen);
+    zot_cond_broadcast(&eng->bg_cv);
+    zot_mutex_unlock(&eng->bg_cs);
 
     PixEntry *evicted = NULL;
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     PixEntry *cur = eng->pix_head;
     while (cur) {
         PixEntry *next = cur->next;
@@ -1096,7 +1232,7 @@ ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) 
         free(eng->pix_recycle[i].ptr);
     }
     eng->pix_recycle_count = 0;
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
 
     while (evicted) {
         PixEntry *next = evicted->next;
@@ -1106,7 +1242,7 @@ ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) 
 
     DLEntry *drop_dls[MAX_DLS];
     int n_dls = 0;
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     int dl_write = 0;
     for (int i = 0; i < eng->dl_count; i++) {
         DLEntry *e = eng->dls[i];
@@ -1119,7 +1255,7 @@ ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) 
         }
     }
     eng->dl_count = dl_write;
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
 
     fz_context *tmp = zot_clone_context(eng->base_ctx);
     if (!tmp) return;
@@ -1143,7 +1279,7 @@ ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
     if (target_pix > (48u << 20)) target_pix = (48u << 20);
 
     PixEntry *evicted = NULL;
-    AcquireSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrlock(&eng->pix_lock);
     for (int i = 0; i < eng->pix_recycle_count; i++) {
         free(eng->pix_recycle[i].ptr);
     }
@@ -1159,7 +1295,7 @@ ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
         ev->next = evicted;
         evicted = ev;
     }
-    ReleaseSRWLockExclusive(&eng->pix_lock);
+    zot_rwlock_wrunlock(&eng->pix_lock);
 
     while (evicted) {
         PixEntry *next = evicted->next;
@@ -1169,7 +1305,7 @@ ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
 
     DLEntry *drop_dls[MAX_DLS];
     int n_dls = 0;
-    AcquireSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrlock(&eng->cache_lock);
     while (eng->dl_count > 8) {
         int victim = 0;
         for (int i = 1; i < eng->dl_count; i++) {
@@ -1181,7 +1317,7 @@ ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
         if (v->refs <= 0) drop_dls[n_dls++] = v;
         eng->dls[victim] = eng->dls[--eng->dl_count];
     }
-    ReleaseSRWLockExclusive(&eng->cache_lock);
+    zot_rwlock_wrunlock(&eng->cache_lock);
 
     fz_context *tmp = zot_clone_context(eng->base_ctx);
     if (!tmp) return;
@@ -1195,13 +1331,13 @@ ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
 ZOT_EXPORT void zot_dll_engine_abort(void *eng_ptr, int req_id) {
     ZotEngine *eng = (ZotEngine *)eng_ptr;
     if (!eng || req_id <= 0) return;
-    AcquireSRWLockShared(&eng->cookie_lock);
+    zot_rwlock_rdlock(&eng->cookie_lock);
     for (int i = 0; i < MAX_ACTIVE_COOKIES; i++) {
         if (eng->cookies[i].req_id == req_id && eng->cookies[i].cookie) {
             zot_cookie_abort(eng->cookies[i].cookie);
         }
     }
-    ReleaseSRWLockShared(&eng->cookie_lock);
+    zot_rwlock_rdunlock(&eng->cookie_lock);
 }
 
 ZOT_EXPORT void *zot_dll_worker_create(void *eng_ptr) {
@@ -1313,7 +1449,7 @@ ZOT_EXPORT int zot_dll_render_rgba(
     }
 
     // 2. Lock-free parallel display-list acquire + direct zero-copy rasterization into out_rgba
-    InterlockedIncrement(&eng->fg_active);
+    zot_atomic32_inc(&eng->fg_active);
 
     fz_cookie cookie;
     memset(&cookie, 0, sizeof(cookie));
@@ -1327,10 +1463,10 @@ ZOT_EXPORT int zot_dll_render_rgba(
     );
     if (!dl) {
         unregister_cookie(eng, &cookie);
-        if (InterlockedDecrement(&eng->fg_active) == 0) {
-            EnterCriticalSection(&eng->bg_cs);
-            WakeAllConditionVariable(&eng->bg_cv);
-            LeaveCriticalSection(&eng->bg_cs);
+        if (zot_atomic32_dec(&eng->fg_active) == 0) {
+            zot_mutex_lock(&eng->bg_cs);
+            zot_cond_broadcast(&eng->bg_cv);
+            zot_mutex_unlock(&eng->bg_cs);
         }
         return aborted ? 1 : -1;
     }
@@ -1356,10 +1492,10 @@ ZOT_EXPORT int zot_dll_render_rgba(
     float ph = dl->bounds.y1 - dl->bounds.y0;
     release_dl(eng, worker->ctx, dl);
 
-    if (InterlockedDecrement(&eng->fg_active) == 0) {
-        EnterCriticalSection(&eng->bg_cs);
-        WakeAllConditionVariable(&eng->bg_cv);
-        LeaveCriticalSection(&eng->bg_cs);
+    if (zot_atomic32_dec(&eng->fg_active) == 0) {
+        zot_mutex_lock(&eng->bg_cs);
+        zot_cond_broadcast(&eng->bg_cv);
+        zot_mutex_unlock(&eng->bg_cs);
     }
 
     if (rc == 0) {

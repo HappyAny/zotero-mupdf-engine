@@ -1,16 +1,16 @@
 # Zotero MuPDF Engine
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-0078D6.svg)](#安装方式zotero-7--10--windows-x64)
-[![Zotero](https://img.shields.io/badge/Zotero-7%20--%2010-CC2936.svg)](#安装方式zotero-7--10--windows-x64)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078D6.svg)](#安装方式zotero-7--10)
+[![Zotero](https://img.shields.io/badge/Zotero-7%20--%2010-CC2936.svg)](#安装方式zotero-7--10)
 
-用 SumatraPDF 同款原生 C 渲染引擎（**MuPDF 1.28.0**，进程内无锁 DLL）接管 Zotero 7–10 内置阅读器的 PDF 画布光栅化与侧栏缩略图渲染，大幅加速复杂矢量图（LaTeX / matplotlib / CAD 工程图）与高分辨率扫描件的翻页与缩放，同时 **100% 保留 Zotero 原生高亮、批注、选字、阅读模式、暗色主题及第三方阅读插件生态**，且无任何独立常驻后台进程。
+用 SumatraPDF 同款原生 C 渲染引擎（**MuPDF 1.28.0**，进程内无锁原生库）接管 Zotero 7–10 内置阅读器的 PDF 画布光栅化与侧栏缩略图渲染，大幅加速复杂矢量图（LaTeX / matplotlib / CAD 工程图）与高分辨率扫描件的翻页与缩放，同时 **100% 保留 Zotero 原生高亮、批注、选字、阅读模式、暗色主题及第三方阅读插件生态**，且无任何独立常驻后台进程。
 
 ---
 
 ## 核心特性
 
-- **进程内原生 MuPDF 1.28.0 DLL（零残留进程）**：通过 Firefox `ChromeWorker` + `js-ctypes` 直接加载无外部依赖的 `zotero-mupdf-native.dll`（仅依赖 Windows 系统 DLL），随 Zotero 退出自动卸载，无黑框、无孤儿进程、无本地 HTTP 端口开销。
+- **跨平台进程内原生 MuPDF 1.28.0 库（零残留进程）**：通过 Firefox `ChromeWorker` + `js-ctypes` 直接加载无外部依赖的原生库（支持 **Windows x64 `.dll`**、**macOS Apple Silicon / Intel `.dylib`** 与 **Linux x64 `.so`**），随 Zotero 退出自动卸载，无黑框、无孤儿进程、无本地 HTTP 端口开销。
 - **只替换光栅化层，零侵入交互生态**：拦截 `PDFPageProxy.prototype.render`，完整保留 `textLayer`、`annotationLayer`、Zotero 批注与高亮覆盖层、划词翻译、Better Notes、阅读模式等一切原生与第三方功能。
 - **无锁多核并行 + 翻页解耦**：
   - 每个前台 Worker 线程持有独立的 `WorkerDocCache`（零文档锁争用），支持同一份 PDF 多页真并行解析与光栅化。
@@ -24,14 +24,14 @@
 - **原生侧栏缩略图加速**：专用无锁 `zot_dll_render_thumb_rgba` 通道，多线程并行生成侧栏缩略图，复用主页面 Display List 缓存且不污染主页面位图缓存；含批注页面的缩略图自动交由 Zotero 原生覆盖层渲染。
 - **亚像素级坐标与主题对齐**：
   - 自动换算变换矩阵 $M_{\text{MuPDF}} = T_{\text{total}} \cdot B^{-1}$，精准适配任意缩放、HiDPI `outputScale`、非零 `CropBox`、页面旋转与放大局部瓦片；发现异常边界不一致时自动无感回退 PDF.js。
-  - 自动读取 Zotero 阅读器主题；在暗色/护眼主题下开启 `invertImages=false` 时，通过自定义 MuPDF `fz_device` 滤镜仅重映射文字与矢量路径颜色，保留位图插图原色。
-- **实时状态与一键对比**：阅读器顶部工具栏提供固定宽度防抖动胶囊按钮 **`● MuPDF ⚡XXms`**（悬停查看引擎耗时、缓存命中率、与 PDF.js 实测均值对比；单击可随时在 MuPDF / PDF.js 之间无缝切换，**Shift + 单击** 清空缓存冷启动对比）。
+  - 自动读取 Zotero 阅读器主题；在暗色/护眼主题下开启 `invertImages=false` 时，通过自定义 MuPDF `fz_device` 滤镜仅重映射文字与矢量路径颜色、保留位图插图原色；开启 `invertImages=true` 时采用 **256 项灰度查表（LUT）+ 整字写入**加速反色重映射。
+- **可视化原生设置面板 & 工具栏一键对比**：在 Zotero **设置 → MuPDF Engine** 提供原生可视化配置面板（实时状态监控、一键释放缓存、修改线程/缓存后无需重启 Zotero 即可热重载引擎）；阅读器顶部工具栏提供固定宽度防抖动胶囊按钮 **`● MuPDF ⚡XXms`**（悬停查看耗时拆解与 PDF.js 对比，单击实时切换，**Shift + 单击** 清缓存冷启动对比）。
 
 ---
 
-## 安装方式（Zotero 7 – 10 / Windows x64）
+## 安装方式（Zotero 7 – 10）
 
-1. 前往 [Releases 页面](https://github.com/HappyAny/zotero-mupdf-engine/releases) 下载最新版本的 `zotero-mupdf-engine-*.xpi`。
+1. 前往 [Releases 页面](https://github.com/HappyAny/zotero-mupdf-engine/releases) 下载最新版本的通用跨平台 `zotero-mupdf-engine-*.xpi`（单个包内置 Windows x64 / macOS arm64 / macOS x64 / Linux x64 原生库，亦可在 Zotero 插件市场搜索安装）。
 2. 在 Zotero 中打开 **工具（Tools） → 插件（Plugins / Add-ons）**。
 3. 点击右上角齿轮图标 → **Install Plugin From File…（从文件安装插件）**，选择刚下载的 `.xpi` 文件。
 4. 打开任意 PDF 标签页，顶部工具栏即可看到 **`● MuPDF`** 状态按钮。
@@ -46,9 +46,9 @@
 
 ---
 
-## 高级首选项
+## 设置面板与高级首选项
 
-可在 Zotero **设置 → 高级 → 配置编辑器（Config Editor）** 中按需微调：
+安装后可直接打开 **设置（Settings） → MuPDF Engine** 进行可视化配置（也可在 **设置 → 高级 → 配置编辑器** 中直接调整以下首选项）：
 
 | 首选项键 | 默认值 | 说明 |
 |---|---|---|
@@ -70,50 +70,55 @@
 
 ```text
 zotero-mupdf-engine/
+├── .github/workflows/
+│   └── build-release.yml           # 4 平台（Win x64 / macOS arm64 & x64 / Linux x64）自动编译与通用 XPI 发布
 ├── engine/
-│   ├── mupdf_render.h / .c         # MuPDF 1.28.0 渲染核心、线程锁、fz_cookie 中止与主题重映射设备
+│   ├── mupdf_render.h / .c         # MuPDF 1.28.0 渲染核心、跨平台锁、fz_cookie 中止与 LUT 主题重映射
 │   └── third_party/mupdf/          # MuPDF 1.28.0 头文件、Windows x64 静态库与上游协议
 ├── native-dll/
-│   ├── zot_dll.h / .c              # 进程内无锁 DLL：WorkerDocCache、DL/RGBA LRU、方向预渲染与缩略图导出
-│   └── test_dll.c                  # 自包含原生 C 单元测试（4K HiDPI、缓存、并发、中文路径、缩略图）
+│   ├── zot_dll.h / .c              # 跨平台进程内无锁原生库：WorkerDocCache、DL/RGBA LRU、方向预渲染与缩略图导出
+│   └── test_dll.c                  # 跨平台自包含 C 单元测试（4K HiDPI、暗色 LUT、并发、中文路径、缩略图、回收）
 ├── plugin/
 │   ├── manifest.json / bootstrap.js / prefs.js
+│   ├── content/
+│   │   ├── preferences.xhtml / .js / .css   # Zotero 7–10 原生可视化设置面板
+│   │   └── icons/icon.svg
 │   └── src/
-│       ├── render-worker.js        # ChromeWorker js-ctypes 桥接与 ArrayBuffer 复用池
-│       ├── engine-client.js        # DLL 释放与生命周期管理、优先级队列、实时中止与统计
-│       ├── reader-hook.js          # 工具栏 UI、零拷贝绘制、缩略图加速、主题检测与多标签页绑定
-│       └── page-patch.js           # PDFPageProxy.render Hook、队列解耦与 getPage 预热
+│       ├── render-worker.js        # ChromeWorker js-ctypes 桥接与空闲自动清空 ArrayBuffer 复用池
+│       ├── engine-client.js        # 跨平台原生库自动加载、优先级队列、实时中止、热重载与 memory-pressure 回收
+│       ├── reader-hook.js          # 工具栏 UI、零拷贝/离屏分帧绘制、缩略图加速、主题检测与标签零泄漏管理
+│       └── page-patch.js           # PDFPageProxy.render Hook、队列解耦与可选 maxOutputScale
 ├── scripts/
-│   ├── build.mjs                   # 编译 DLL、检查系统依赖、运行原生 C 测试并打包 .xpi
-│   └── verify-plugin.mjs           # 插件语法、坐标矩阵对齐、生命周期与回归测试
+│   ├── build.mjs                   # 跨平台编译原生库、检查纯系统依赖、运行 C 测试并打包 .xpi
+│   └── verify-plugin.mjs           # 插件语法、设置面板、4 平台路由、坐标对齐与回归测试
 └── updates.json                    # Zotero 插件自动更新清单
 ```
 
 ---
 
-## 从源码构建与测试（Windows x64）
+## 从源码构建与测试（Windows / macOS / Linux）
 
-### 环境要求
+### 自动构建通用 4 平台安装包（推荐）
 
-- **MinGW-w64**（64 位 `gcc` 与 `objdump`，位于 `PATH` 或通过环境变量 `GCC_DIR` 指定 `bin` 目录）
-- **Node.js** 18+
-- **PowerShell**（`pwsh`，用于打包 `.xpi`）
+推送 `v*` 标签（或在 GitHub Actions 手动触发 `Build & Release Universal XPI`）后，CI 会在 **Windows x64**、**macOS Apple Silicon (`macos-14`)**、**macOS Intel (`macos-15-intel`)** 和 **Linux x64 (`ubuntu-24.04`)** 四个原生环境并行编译并运行 C 单元测试，最终自动打包并发布包含全平台原生库的单一通用 `.xpi`。
 
-### 构建与验证
+### 本地构建与验证
+
+- **Windows x64**：安装 MinGW-w64（`gcc`/`objdump` 在 `PATH` 中，或设 `$env:GCC_DIR`）、Node.js 18+、`pwsh`，运行：
 
 ```powershell
-# 1. 编译进程内原生 DLL + 校验仅依赖 Windows 系统 DLL + 运行自包含 C 测试 + 打包 dist/*.xpi
+# 1. 编译 Windows x64 原生 DLL + 依赖检查 + 自包含 C 测试 + 打包 dist/*.xpi
 node scripts/build.mjs
 
-# 2. 运行插件语法、Zotero 10 生命周期、坐标变换数学对齐与多标签页回归测试
+# 2. 运行全套插件校验与回归测试
 node scripts/verify-plugin.mjs
 ```
 
-如需指定 MinGW 目录，可在运行前设置环境变量：
+- **macOS / Linux**：先静态编译 MuPDF 1.28.0（`make build=release HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no HAVE_OBJCOPY=no USE_SYSTEM_LIBS=no XCFLAGS="-fPIC" libs`），然后指定 `MUPDF_INC_DIR` 与 `MUPDF_LIB_DIR` 运行：
 
-```powershell
-$env:GCC_DIR = "C:\msys64\mingw64\bin"
-node scripts/build.mjs
+```bash
+MUPDF_INC_DIR=/path/to/mupdf/include MUPDF_LIB_DIR=/path/to/mupdf/build/release node scripts/build.mjs
+node scripts/verify-plugin.mjs
 ```
 
 ---

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Zotero MuPDF Engine",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Replace Zotero's PDF canvas rasterizer with native MuPDF (SumatraPDF's rendering engine) while keeping Zotero native highlights, text selection, themes, and third-party reader plugins.",
   "author": "HappyAny",
   "icons": {

@@ -3,6 +3,7 @@
 
 var ZotMuPDFPlugin = null;
 var ZotMuPDFChromeHandle = null;
+var ZotMuPDFPrefPaneID = null;
 
 function install() {}
 
@@ -12,12 +13,14 @@ async function startup({ id, version, rootURI }) {
   try {
     await Zotero.initializationPromise;
 
-    // Register chrome://zotmupdf/content/ so ChromeWorker loads cleanly even from jar: URLs containing '@'
+    // Register chrome://zotmupdf/content/ (src/) & chrome://zotmupdfui/content/ (content/)
+    // so ChromeWorker AND Zotero.PreferencePanes load cleanly even from jar: URLs containing '@'
     const aomStartup = Components.classes["@mozilla.org/addons/addon-manager-startup;1"]
       .getService(Components.interfaces.amIAddonManagerStartup);
     const manifestURI = Services.io.newURI(rootURI + "manifest.json");
     ZotMuPDFChromeHandle = aomStartup.registerChrome(manifestURI, [
       ["content", "zotmupdf", rootURI + "src/"],
+      ["content", "zotmupdfui", rootURI + "content/"],
     ]);
 
     const prefBranch = Services.prefs.getDefaultBranch("");
@@ -54,7 +57,25 @@ async function startup({ id, version, rootURI }) {
     Zotero.ZotMuPDF = ZotMuPDFPlugin;
 
     await readerHook.init();
-    Zotero.debug(`[ZotMuPDF] Plugin v${version} initialized (in-process native MuPDF DLL)`);
+
+    if (Zotero.PreferencePanes && typeof Zotero.PreferencePanes.register === "function") {
+      try {
+        ZotMuPDFPrefPaneID = await Zotero.PreferencePanes.register({
+          pluginID: id,
+          id: "zotero-mupdf-engine-prefpane",
+          label: "MuPDF Engine",
+          image: "chrome://zotmupdfui/content/icons/icon.svg",
+          src: "chrome://zotmupdfui/content/preferences.xhtml",
+          scripts: ["chrome://zotmupdfui/content/preferences.js"],
+          stylesheets: ["chrome://zotmupdfui/content/preferences.css"],
+          helpURL: "https://github.com/HappyAny/zotero-mupdf-engine",
+        });
+      } catch (prefErr) {
+        Zotero.logError(prefErr);
+      }
+    }
+
+    Zotero.debug(`[ZotMuPDF] Plugin v${version} initialized (in-process native MuPDF library)`);
 
     if (engineClient.isEnabled()) {
       engineClient.ensureStarted().catch(err => {
@@ -74,6 +95,12 @@ function onMainWindowLoad() {
 function onMainWindowUnload() {}
 
 async function shutdown() {
+  if (ZotMuPDFPrefPaneID) {
+    try {
+      Zotero.PreferencePanes?.unregister?.(ZotMuPDFPrefPaneID);
+    } catch {}
+    ZotMuPDFPrefPaneID = null;
+  }
   if (ZotMuPDFPlugin) {
     const plugin = ZotMuPDFPlugin;
     ZotMuPDFPlugin = null;

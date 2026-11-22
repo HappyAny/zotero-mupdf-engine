@@ -1,0 +1,86 @@
+#zot-mupdf-prefpane {
+  max-width: 680px;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-heading {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 16px 0 8px 0;
+  opacity: 0.9;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--fill-quinary, rgba(128, 128, 128, 0.25));
+  background: var(--material-background, rgba(128, 128, 128, 0.05));
+}
+
+#zot-mupdf-prefpane .zot-mupdf-status-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+  flex: 0 0 auto;
+  background-color: #9ca3af;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-status-detail {
+  font-size: 12px;
+  line-height: 1.55;
+  opacity: 0.85;
+  white-space: pre-line;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-toast {
+  font-size: 11.5px;
+  min-height: 16px;
+  color: #16a34a;
+  opacity: 0.95;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-label {
+  font-size: 12.5px;
+  flex: 1 1 auto;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-select {
+  min-width: 220px;
+  max-width: 320px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+
+#zot-mupdf-prefpane .zot-mupdf-hint {
+  margin: 2px 0 0 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  opacity: 0.72;
+}

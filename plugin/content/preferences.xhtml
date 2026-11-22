@@ -1,0 +1,94 @@
+<vbox id="zot-mupdf-prefpane" class="main-section" onload="window.ZotMuPDFPrefs &amp;&amp; window.ZotMuPDFPrefs.init()">
+  <html:div class="zot-mupdf-card zot-mupdf-status-card">
+    <html:div class="zot-mupdf-status-header">
+      <html:span id="zot-mupdf-status-dot" class="zot-mupdf-dot"></html:span>
+      <html:span id="zot-mupdf-status-title" class="zot-mupdf-status-title">正在读取引擎状态…</html:span>
+    </html:div>
+    <html:div id="zot-mupdf-status-detail" class="zot-mupdf-status-detail"></html:div>
+    <html:div class="zot-mupdf-actions">
+      <button id="zot-mupdf-btn-trim" label="立即释放缓存" />
+      <button id="zot-mupdf-btn-restart" label="应用并重载引擎" />
+      <button id="zot-mupdf-btn-reset" label="恢复默认设置" />
+    </html:div>
+    <html:div id="zot-mupdf-toast" class="zot-mupdf-toast"></html:div>
+  </html:div>
+
+  <html:h2 class="zot-mupdf-heading">渲染与显示（修改后立即生效）</html:h2>
+  <html:div class="zot-mupdf-card">
+    <checkbox id="zot-mupdf-enabled" label="启用 MuPDF 原生渲染引擎（关闭后回退原生 PDF.js）" />
+    <checkbox id="zot-mupdf-renderThumbnails" label="启用侧栏缩略图多线程加速（含批注页面自动保留原生覆盖层）" />
+    <checkbox id="zot-mupdf-softwareCanvas" label="使用 Skia 软件画布（推荐，配合 WebRender 异步上传与离屏分帧绘制）" />
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-aaLevel">抗锯齿等级（AA Level）</html:label>
+      <html:select id="zot-mupdf-aaLevel" class="zot-mupdf-select">
+        <html:option value="8">8 — 最高清晰度（推荐）</html:option>
+        <html:option value="6">6 — 高清晰度</html:option>
+        <html:option value="4">4 — 标准</html:option>
+        <html:option value="2">2 — 轻量</html:option>
+        <html:option value="0">0 — 关闭抗锯齿</html:option>
+      </html:select>
+    </html:div>
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-maxOutputScale">高分屏画布 DPR 上限（可选）</html:label>
+      <html:select id="zot-mupdf-maxOutputScale" class="zot-mupdf-select">
+        <html:option value="">原生满分辨率（默认，最清晰）</html:option>
+        <html:option value="1.5">1.5× — 推荐 2K/4K 屏（省约 40% 绘制耗时与 GPU 显存）</html:option>
+        <html:option value="1.25">1.25× — 极速轻量模式</html:option>
+        <html:option value="1.0">1.0× — 最低显存占用</html:option>
+      </html:select>
+    </html:div>
+    <html:p class="zot-mupdf-hint">注：DPR 上限仅作用于主页面光栅化，不影响放大局部瓦片清晰度，且高亮、批注和选字坐标 100% 精准。</html:p>
+  </html:div>
+
+  <html:h2 class="zot-mupdf-heading">线程与内存预算（修改后点上方“应用并重载引擎”立即生效）</html:h2>
+  <html:div class="zot-mupdf-card">
+    <checkbox id="zot-mupdf-prerender" label="开启方向感知后台预渲染（自动预渲染 +1 / +2 / -1 邻近页，前台活跃时让步）" />
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-workers">前台渲染线程数</html:label>
+      <html:select id="zot-mupdf-workers" class="zot-mupdf-select">
+        <html:option value="1">1 线程（最低内存）</html:option>
+        <html:option value="2">2 线程（推荐均衡）</html:option>
+        <html:option value="3">3 线程（多页/缩略图更快）</html:option>
+        <html:option value="4">4 线程（高性能）</html:option>
+      </html:select>
+    </html:div>
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-bgWorkers">后台最低优先级预渲染线程数</html:label>
+      <html:select id="zot-mupdf-bgWorkers" class="zot-mupdf-select">
+        <html:option value="0">0（关闭后台预渲染）</html:option>
+        <html:option value="1">1 线程（推荐，不抢占主界面）</html:option>
+        <html:option value="2">2 线程（连续快翻更激进）</html:option>
+      </html:select>
+    </html:div>
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-pixCacheMB">预渲染位图缓存上限（空闲 20 秒自动收缩）</html:label>
+      <html:select id="zot-mupdf-pixCacheMB" class="zot-mupdf-select">
+        <html:option value="48">48 MB（极低内存）</html:option>
+        <html:option value="96">96 MB（推荐）</html:option>
+        <html:option value="128">128 MB</html:option>
+        <html:option value="256">256 MB</html:option>
+        <html:option value="512">512 MB（大内存设备）</html:option>
+      </html:select>
+    </html:div>
+
+    <html:div class="zot-mupdf-row">
+      <html:label class="zot-mupdf-label" for="zot-mupdf-storeMB">MuPDF 内部资源存储缓存上限</html:label>
+      <html:select id="zot-mupdf-storeMB" class="zot-mupdf-select">
+        <html:option value="64">64 MB（低内存）</html:option>
+        <html:option value="96">96 MB（推荐）</html:option>
+        <html:option value="128">128 MB</html:option>
+        <html:option value="256">256 MB（复杂工程大图）</html:option>
+      </html:select>
+    </html:div>
+  </html:div>
+
+  <html:h2 class="zot-mupdf-heading">诊断与调试</html:h2>
+  <html:div class="zot-mupdf-card">
+    <checkbox id="zot-mupdf-debugLog" label="输出详细调试日志到 Zotero Debug Output（排查问题时开启）" />
+  </html:div>
+</vbox>

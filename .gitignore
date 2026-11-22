@@ -1,7 +1,10 @@
 # Build outputs
 dist/
 plugin/bin/*.dll
+plugin/bin/*.dylib
+plugin/bin/*.so
 plugin/bin/*.exe
+native-dll/test_dll
 native-dll/test_dll.exe
 *.exe
 *.o

@@ -25,6 +25,7 @@ async function verifySyntaxAndBootstrap() {
 
   const jsFiles = [
     "bootstrap.js",
+    "content/preferences.js",
     "src/engine-client.js",
     "src/reader-hook.js",
     "src/page-patch.js",
@@ -35,9 +36,17 @@ async function verifySyntaxAndBootstrap() {
     new vm.Script(src, { filename: rel });
   }
 
+  // Verify preferences.xhtml is well-formed XML (no unescaped '&' and matching tags)
+  const prefXhtml = fs.readFileSync(path.join(PLUGIN_DIR, "content/preferences.xhtml"), "utf8");
+  assert(prefXhtml.includes('id="zot-mupdf-prefpane"'), "preferences.xhtml must define root #zot-mupdf-prefpane");
+  assert(!/&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)/.test(prefXhtml), "preferences.xhtml has unescaped '&'");
+
   const fakePrefs = new Map();
   let registeredToolbarCb = null;
   let chromeRegistered = false;
+  let chromeUiRegistered = false;
+  let prefPaneRegistered = null;
+  let prefPaneUnregistered = null;
   let chromeDestructed = false;
   let loggedErrors = [];
 
@@ -67,6 +76,15 @@ async function verifySyntaxAndBootstrap() {
       Notifier: {
         registerObserver() { return 1; },
         unregisterObserver() {},
+      },
+      PreferencePanes: {
+        async register(opts) {
+          prefPaneRegistered = opts;
+          return opts.id;
+        },
+        unregister(id) {
+          prefPaneUnregistered = id;
+        },
       },
       getMainWindow() { return null; },
       Profile: { dir: "C:\\tmp" },
@@ -98,6 +116,7 @@ async function verifySyntaxAndBootstrap() {
             return {
               registerChrome(_uri, entries) {
                 chromeRegistered = entries.some(e => e[0] === "content" && e[1] === "zotmupdf");
+                chromeUiRegistered = entries.some(e => e[0] === "content" && e[1] === "zotmupdfui");
                 return { destruct() { chromeDestructed = true; } };
               },
             };
@@ -132,15 +151,34 @@ async function verifySyntaxAndBootstrap() {
   });
   assert(loggedErrors.length === 0, "Unexpected startup errors: " + loggedErrors.map(String).join("; "));
   assert(chromeRegistered, "chrome://zotmupdf/content/ must be registered for ChromeWorker");
+  assert(chromeUiRegistered, "chrome://zotmupdfui/content/ must be registered for PreferencePanes");
+  assert(
+    prefPaneRegistered && prefPaneRegistered.src === "chrome://zotmupdfui/content/preferences.xhtml",
+    "PreferencePane must register chrome://zotmupdfui/content/preferences.xhtml"
+  );
   assert(typeof registeredToolbarCb === "function", "renderToolbar listener was NOT registered!");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.workers") === 2, "v0.7.1 default workers must be 2");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.bgWorkers") === 1, "v0.7.1 default bgWorkers must be 1");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.storeMB") === 96, "v0.7.1 default storeMB must be 96");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.pixCacheMB") === 96, "v0.7.1 default pixCacheMB must be 96");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.maxOutputScale") === "", "v0.7.1 default maxOutputScale must be empty");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.workers") === 2, "v0.8.0 default workers must be 2");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.bgWorkers") === 1, "v0.8.0 default bgWorkers must be 1");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.storeMB") === 96, "v0.8.0 default storeMB must be 96");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.pixCacheMB") === 96, "v0.8.0 default pixCacheMB must be 96");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.maxOutputScale") === "", "v0.8.0 default maxOutputScale must be empty");
+
+  // Verify cross-platform native binary resolution in EngineClient
+  const ec = ctx.ZotMuPDFPlugin.engineClient;
+  const checkPlat = (OS, XPCOMABI, expectedFile) => {
+    fakeGlobal.Services.appinfo = { OS, XPCOMABI };
+    const spec = ec._getNativeBinarySpec();
+    assert(spec.candidates[0] === expectedFile, `Expected ${expectedFile} for ${OS}/${XPCOMABI}, got ${spec.candidates[0]}`);
+  };
+  checkPlat("WINNT", "x86_64-msvc", "zotero-mupdf-native-win-x64.dll");
+  checkPlat("Darwin", "aarch64-gcc3", "zotero-mupdf-native-darwin-arm64.dylib");
+  checkPlat("Darwin", "x86_64-gcc3", "zotero-mupdf-native-darwin-x64.dylib");
+  checkPlat("Linux", "x86_64-gcc3", "zotero-mupdf-native-linux-x64.so");
+
   await ctx.shutdown();
+  assert(prefPaneUnregistered === "zotero-mupdf-engine-prefpane", "PreferencePane must unregister on shutdown");
   assert(chromeDestructed, "chromeHandle.destruct() must run on shutdown");
-  console.log("[check 1] manifest.json, 5 JS files syntax, v0.7.1 lean defaults & Zotero 10 startup/shutdown OK!");
+  console.log("[check 1] manifest.json, 6 JS files + XHTML, PreferencePane, 4-platform ABI routing & startup/shutdown OK!");
 }
 
 // Exact copy of Zotero 10.0.8 pdf.mjs PageViewport constructor

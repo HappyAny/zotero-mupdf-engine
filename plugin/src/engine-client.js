@@ -6,7 +6,6 @@ var ZotMuPDFEngineClient = (function () {
   const Ci = Components.interfaces;
   const { setTimeout, clearTimeout } = ChromeUtils.importESModule("resource://gre/modules/Timer.sys.mjs");
   const PREF_PREFIX = "extensions.zotero-mupdf-engine.";
-  const ENGINE_DLL_NAME = "zotero-mupdf-native.dll";
   const WORKER_URI = "chrome://zotmupdf/content/render-worker.js";
 
   function nowMs() {
@@ -87,7 +86,7 @@ var ZotMuPDFEngineClient = (function () {
   class EngineClient {
     constructor({ rootURI, version }) {
       this.rootURI = rootURI;
-      this.version = version || "0.7.1";
+      this.version = version || "0.8.0";
       this.dllPath = "";
       this.ctrlLib = null;
       this.ctrlEng = null;
@@ -260,12 +259,59 @@ var ZotMuPDFEngineClient = (function () {
       }, 20000);
     }
 
+    _getNativeBinarySpec() {
+      const os = String(Services.appinfo?.OS || "WINNT").toLowerCase();
+      const abi = String(Services.appinfo?.XPCOMABI || "").toLowerCase();
+      const isArm64 = abi.includes("aarch64") || abi.includes("arm64");
+      const isX64 = abi.includes("x86_64") || abi.includes("amd64") || (!abi && os === "winnt");
+
+      if (os === "winnt") {
+        if (!isX64) {
+          throw new Error(`Unsupported Windows architecture: ${abi || "unknown"} (x64 required)`);
+        }
+        return {
+          ext: ".dll",
+          tag: "win-x64",
+          candidates: ["zotero-mupdf-native-win-x64.dll", "zotero-mupdf-native.dll"],
+        };
+      }
+      if (os === "darwin") {
+        if (isArm64) {
+          return {
+            ext: ".dylib",
+            tag: "darwin-arm64",
+            candidates: ["zotero-mupdf-native-darwin-arm64.dylib"],
+          };
+        }
+        if (isX64) {
+          return {
+            ext: ".dylib",
+            tag: "darwin-x64",
+            candidates: ["zotero-mupdf-native-darwin-x64.dylib"],
+          };
+        }
+        throw new Error(`Unsupported macOS architecture: ${abi || "unknown"}`);
+      }
+      if (os === "linux") {
+        if (isX64) {
+          return {
+            ext: ".so",
+            tag: "linux-x64",
+            candidates: ["zotero-mupdf-native-linux-x64.so"],
+          };
+        }
+        throw new Error(`Unsupported Linux architecture: ${abi || "unknown"} (x86_64 required)`);
+      }
+      throw new Error(`Unsupported platform: ${os}/${abi}`);
+    }
+
     async _ensureDLLExtracted() {
+      const spec = this._getNativeBinarySpec();
       const binDir = PathUtils.join(Zotero.Profile.dir, "zotero-mupdf-engine", "bin");
       await IOUtils.makeDirectory(binDir, { ignoreExisting: true, createAncestors: true });
 
       const safeVer = String(this.version).replace(/[^0-9A-Za-z._-]/g, "_");
-      const targetName = `zotero-mupdf-native-${safeVer}.dll`;
+      const targetName = `zotero-mupdf-native-${spec.tag}-${safeVer}${spec.ext}`;
       const targetPath = PathUtils.join(binDir, targetName);
 
       let needsExtract = true;
@@ -277,21 +323,41 @@ var ZotMuPDFEngineClient = (function () {
       } catch {}
 
       if (needsExtract) {
-        const srcURI = this.rootURI + "bin/" + ENGINE_DLL_NAME;
         const tmpPath = targetPath + ".tmp";
-        await extractUriToFile(srcURI, tmpPath);
-        const tmpStat = await IOUtils.stat(tmpPath);
-        if (!tmpStat || tmpStat.size < 1000000) {
-          await IOUtils.remove(tmpPath).catch(() => {});
-          throw new Error(`Extracted MuPDF DLL invalid (${tmpStat?.size || 0} bytes) from ${srcURI}`);
+        let extracted = false;
+        let lastErr = null;
+        for (const cand of spec.candidates) {
+          const srcURI = this.rootURI + "bin/" + cand;
+          try {
+            await extractUriToFile(srcURI, tmpPath);
+            const tmpStat = await IOUtils.stat(tmpPath);
+            if (!tmpStat || tmpStat.size < 1000000) {
+              await IOUtils.remove(tmpPath).catch(() => {});
+              throw new Error(`Extracted MuPDF native library invalid (${tmpStat?.size || 0} bytes) from ${srcURI}`);
+            }
+            extracted = true;
+            break;
+          } catch (e) {
+            lastErr = e;
+            await IOUtils.remove(tmpPath).catch(() => {});
+          }
+        }
+        if (!extracted) {
+          throw lastErr || new Error(`Native MuPDF binary not bundled for ${spec.tag}`);
         }
         await IOUtils.move(tmpPath, targetPath);
 
-        // Clean up older versioned binaries/DLLs best-effort
+        // Clean up older versioned binaries best-effort
         try {
           const children = await IOUtils.getChildren(binDir);
           for (const child of children) {
-            if (child !== targetPath && (child.endsWith(".dll") || child.endsWith(".exe"))) {
+            if (
+              child !== targetPath &&
+              (child.endsWith(".dll") ||
+                child.endsWith(".dylib") ||
+                child.endsWith(".so") ||
+                child.endsWith(".exe"))
+            ) {
               IOUtils.remove(child).catch(() => {});
             }
           }
@@ -798,6 +864,19 @@ var ZotMuPDFEngineClient = (function () {
       this.stats.lastFallbackReason = String(reason || "");
       this.log("Fallback to PDF.js:", reason);
       this._emitStats();
+    }
+
+    async restart() {
+      await this.shutdown();
+      this.stopped = false;
+      this.ready = false;
+      this.consecutiveFailures = 0;
+      this.lastFailAt = 0;
+      this.lastError = "";
+      this._emitStats(true);
+      if (this.isEnabled()) {
+        await this.ensureStarted();
+      }
     }
 
     async shutdown() {

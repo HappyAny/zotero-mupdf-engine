@@ -1,9 +1,21 @@
 #include "zot_dll.h"
-#include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#include <process.h>
 #include <windows.h>
+#define TEST_SLEEP_MS(ms) Sleep(ms)
+#define TEST_THREAD_RET unsigned __stdcall
+#define TEST_THREAD_RETURN return 0
+#else
+#include <pthread.h>
+#include <unistd.h>
+#define TEST_SLEEP_MS(ms) usleep((useconds_t)(ms) * 1000u)
+#define TEST_THREAD_RET void *
+#define TEST_THREAD_RETURN return NULL
+#endif
 
 typedef struct {
     void *eng;
@@ -14,11 +26,15 @@ typedef struct {
 } ThreadJob;
 
 static int write_sample_pdf_utf8(const char *utf8_path) {
+#ifdef _WIN32
     wchar_t wpath[MAX_PATH * 2];
     if (MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0) {
         return 0;
     }
     FILE *fp = _wfopen(wpath, L"wb");
+#else
+    FILE *fp = fopen(utf8_path, "wb");
+#endif
     if (!fp) return 0;
 
     // Build a valid 3-page PDF with vector content on each page and exact xref byte offsets
@@ -64,11 +80,16 @@ static int write_sample_pdf_utf8(const char *utf8_path) {
     return 1;
 }
 
-static void delete_utf8_file(const char *utf8_path) {
+static int delete_utf8_file(const char *utf8_path) {
+#ifdef _WIN32
     wchar_t wpath[MAX_PATH * 2];
     if (MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) > 0) {
-        DeleteFileW(wpath);
+        return DeleteFileW(wpath) ? 1 : 0;
     }
+    return 0;
+#else
+    return unlink(utf8_path) == 0 ? 1 : 0;
+#endif
 }
 
 static int has_non_white_pixels(const unsigned char *rgba, int width, int height) {
@@ -81,10 +102,10 @@ static int has_non_white_pixels(const unsigned char *rgba, int width, int height
     return 0;
 }
 
-static unsigned __stdcall parallel_worker(void *arg) {
+static TEST_THREAD_RET parallel_worker(void *arg) {
     ThreadJob *j = (ThreadJob *)arg;
     void *w = zot_dll_worker_create(j->eng);
-    if (!w) return 1;
+    if (!w) TEST_THREAD_RETURN;
     int width = 2000, height = 2600;
     unsigned char *buf = (unsigned char *)malloc((size_t)width * (size_t)height * 4);
     float stats[4] = {0};
@@ -96,30 +117,44 @@ static unsigned __stdcall parallel_worker(void *arg) {
     j->ms = stats[0];
     free(buf);
     zot_dll_worker_destroy(w);
-    return 0;
+    TEST_THREAD_RETURN;
 }
 
 int main(void) {
     printf("DLL MuPDF version: %s\n", zot_dll_version());
 
+    char temp_utf8[1024] = {0};
+    unsigned long pid_num = 0;
+#ifdef _WIN32
     wchar_t wtemp[MAX_PATH];
     DWORD tlen = GetTempPathW(MAX_PATH, wtemp);
     if (tlen == 0 || tlen >= MAX_PATH) {
         printf("GetTempPathW failed\n");
         return 1;
     }
-    char temp_utf8[MAX_PATH * 3] = {0};
     if (WideCharToMultiByte(CP_UTF8, 0, wtemp, -1, temp_utf8, sizeof(temp_utf8), NULL, NULL) <= 0) {
         printf("WideCharToMultiByte failed\n");
         return 1;
     }
+    pid_num = (unsigned long)GetCurrentProcessId();
+#else
+    const char *td = getenv("TMPDIR");
+    if (!td || !td[0]) td = "/tmp";
+    size_t tdlen = strlen(td);
+    if (tdlen > 0 && td[tdlen - 1] == '/') {
+        snprintf(temp_utf8, sizeof(temp_utf8), "%s", td);
+    } else {
+        snprintf(temp_utf8, sizeof(temp_utf8), "%s/", td);
+    }
+    pid_num = (unsigned long)getpid();
+#endif
 
-    char pdf_path[MAX_PATH * 4];
-    char cn_path[MAX_PATH * 4];
-    snprintf(pdf_path, sizeof(pdf_path), "%szot_mupdf_test_%lu.pdf", temp_utf8, (unsigned long)GetCurrentProcessId());
+    char pdf_path[1280];
+    char cn_path[1280];
+    snprintf(pdf_path, sizeof(pdf_path), "%szot_mupdf_test_%lu.pdf", temp_utf8, pid_num);
     // UTF-8 Chinese filename: 测试文档
     snprintf(cn_path, sizeof(cn_path), "%szot_mupdf_\xe6\xb5\x8b\xe8\xaf\x95\xe6\x96\x87\xe6\xa1\xa3_%lu.pdf",
-             temp_utf8, (unsigned long)GetCurrentProcessId());
+             temp_utf8, pid_num);
 
     const char *env_pdf = getenv("ZOT_TEST_PDF");
     int created_main = 0;
@@ -174,7 +209,7 @@ int main(void) {
            rc2, stats[0], stats[1]);
 
     // Wait 300ms for low-priority background pre-render of page 2 (index 1)
-    Sleep(300);
+    TEST_SLEEP_MS(300);
     int rc3 = zot_dll_render_rgba(eng, w, 3, pdf_path, "", 1, width, height,
                                   3.69f, 0, 0, 3.38f, 0, 0, 1, 8, 0, 0, 0, 0,
                                   rgba, stats, err, sizeof(err));
@@ -190,6 +225,7 @@ int main(void) {
         { eng, pdf_path, 1, 0, 0 },
         { eng, pdf_path, 2, 0, 0 },
     };
+#ifdef _WIN32
     HANDLE hs[3];
     for (int i = 0; i < 3; i++) {
         hs[i] = (HANDLE)_beginthreadex(NULL, 0, parallel_worker, &jobs[i], 0, NULL);
@@ -200,6 +236,17 @@ int main(void) {
         CloseHandle(hs[i]);
         if (!jobs[i].ok) par_ok = 0;
     }
+#else
+    pthread_t ths[3];
+    for (int i = 0; i < 3; i++) {
+        pthread_create(&ths[i], NULL, parallel_worker, &jobs[i]);
+    }
+    int par_ok = 1;
+    for (int i = 0; i < 3; i++) {
+        pthread_join(ths[i], NULL);
+        if (!jobs[i].ok) par_ok = 0;
+    }
+#endif
     printf("3-thread lock-free parallel same-PDF render: ok=%d (p1=%.1fms, p2=%.1fms, p3=%.1fms)\n",
            par_ok, jobs[0].ms, jobs[1].ms, jobs[2].ms);
 
@@ -211,6 +258,21 @@ int main(void) {
     printf("Chinese UTF-8 path PDF: rc=%d, px=%d, ms=%.2f, page=%.1fx%.1f, err=%s\n",
            rc4, px4, stats[0], stats[2], stats[3], err);
 
+    // Test dark-mode LUT pixel theme (invert_images=1) & device theme (invert_images=0) at 4K HiDPI
+    int rc_dark1 = zot_dll_render_rgba(eng, w, 7, pdf_path, "", 0, width, height,
+                                       3.69f, 0, 0, 3.38f, 0, 0, 1, 8, 1, 0x1E1E1E, 0xE5E5E5, 1,
+                                       rgba, stats, err, sizeof(err));
+    int dark1_bg_ok = (rc_dark1 == 0 && rgba[0] == 0x1E && rgba[1] == 0x1E && rgba[2] == 0x1E && rgba[3] == 255);
+    printf("Dark-mode 4K LUT (invertImages=1, 2200x2850): rc=%d, bg_ok=%d, ms=%.2f, err=%s\n",
+           rc_dark1, dark1_bg_ok, stats[0], err);
+
+    int rc_dark0 = zot_dll_render_rgba(eng, w, 8, pdf_path, "", 0, width, height,
+                                       3.69f, 0, 0, 3.38f, 0, 0, 1, 8, 1, 0x1E1E1E, 0xE5E5E5, 0,
+                                       rgba, stats, err, sizeof(err));
+    int dark0_bg_ok = (rc_dark0 == 0 && rgba[0] == 0x1E && rgba[1] == 0x1E && rgba[2] == 0x1E && rgba[3] == 255);
+    printf("Dark-mode 4K Device (invertImages=0, 2200x2850): rc=%d, bg_ok=%d, ms=%.2f, err=%s\n",
+           rc_dark0, dark0_bg_ok, stats[0], err);
+
     // Test fast native thumbnail renderer
     float tstats[4] = {0};
     int rc5 = zot_dll_render_thumb_rgba(eng, w, 5, pdf_path, "", 0, 240, 520, 4, 0, 0, 0, 0,
@@ -219,16 +281,11 @@ int main(void) {
     printf("Native thumbnail (240w): rc=%d, px=%d, ms=%.2f, dims=%.0fx%.0f, aspect=%.3f, err=%s\n",
            rc5, px5, tstats[0], tstats[1], tstats[2], tstats[3], err);
 
-    // Test per-path eviction + worker trim + soft/aggressive memory trim (proves clean handle/RAM release!)
+    // Test per-path eviction + worker trim + soft/aggressive memory trim
     zot_dll_engine_evict_path(eng, cn_path);
     zot_dll_worker_trim(w);
-    Sleep(50);
-    // Verify cn_path is actually unlocked on Windows and can be deleted while engine is still running!
-    wchar_t wcn[MAX_PATH * 2];
-    int del_cn_ok = 0;
-    if (MultiByteToWideChar(CP_UTF8, 0, cn_path, -1, wcn, (int)(sizeof(wcn) / sizeof(wcn[0]))) > 0) {
-        del_cn_ok = DeleteFileW(wcn) ? 1 : 0;
-    }
+    TEST_SLEEP_MS(50);
+    int del_cn_ok = delete_utf8_file(cn_path);
     zot_dll_engine_trim(eng, 0);
     zot_dll_engine_trim(eng, 1);
     int rc6 = zot_dll_render_rgba(eng, w, 6, pdf_path, "", 0, 1200, 1600,
@@ -245,5 +302,6 @@ int main(void) {
     if (created_main) delete_utf8_file(pdf_path);
     if (!del_cn_ok) delete_utf8_file(cn_path);
 
-    return (rc1 == 0 && px1 && tier2_ok && tier3_ok && px3 && rc4 == 0 && px4 && rc5 == 0 && px5 && rc6 == 0 && px6 && del_cn_ok && par_ok) ? 0 : 1;
+    return (rc1 == 0 && px1 && tier2_ok && tier3_ok && px3 && rc4 == 0 && px4 &&
+            dark1_bg_ok && dark0_bg_ok && rc5 == 0 && px5 && rc6 == 0 && px6 && del_cn_ok && par_ok) ? 0 : 1;
 }
