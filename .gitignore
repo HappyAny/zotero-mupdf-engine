@@ -1,0 +1,17 @@
+# Build outputs
+dist/
+plugin/bin/*.dll
+plugin/bin/*.exe
+native-dll/test_dll.exe
+*.exe
+*.o
+*.obj
+*.pdb
+*.tmp
+
+# OS / IDE artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
