@@ -28,9 +28,10 @@ async function startup({ id, version, rootURI }) {
       "extensions.zotero-mupdf-engine.workers": 2,
       "extensions.zotero-mupdf-engine.bgWorkers": 1,
       "extensions.zotero-mupdf-engine.storeMB": 96,
-      "extensions.zotero-mupdf-engine.pixCacheMB": 128,
+      "extensions.zotero-mupdf-engine.pixCacheMB": 96,
       "extensions.zotero-mupdf-engine.prerender": true,
       "extensions.zotero-mupdf-engine.softwareCanvas": true,
+      "extensions.zotero-mupdf-engine.maxOutputScale": "",
       "extensions.zotero-mupdf-engine.debugLog": false,
     };
     for (const [k, v] of Object.entries(defaults)) {

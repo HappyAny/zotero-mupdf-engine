@@ -74,6 +74,29 @@
     return false;
   }
 
+  function isPageVisibleInViewer(pageNumber, pageIndex) {
+    try {
+      const pv = window.PDFViewerApplication?.pdfViewer;
+      if (!pv) return true;
+      if (typeof pv._getVisiblePages === "function") {
+        const vis = pv._getVisiblePages();
+        if (vis && vis.ids && vis.ids.size > 0) {
+          return vis.ids.has(pageNumber);
+        }
+      }
+      const pageDiv = pv._pages?.[pageIndex]?.div;
+      const container = pv.container;
+      if (pageDiv && container && typeof pageDiv.getBoundingClientRect === "function") {
+        const pr = pageDiv.getBoundingClientRect();
+        const cr = container.getBoundingClientRect();
+        if (cr.width > 0 && cr.height > 0 && pr.height > 0) {
+          return pr.bottom >= cr.top - 40 && pr.top <= cr.bottom + 40;
+        }
+      }
+    } catch {}
+    return true;
+  }
+
   function makeCancelledError(pageNumber) {
     const Ctor = window.pdfjsLib?.RenderingCancelledException;
     if (Ctor) {
@@ -125,8 +148,10 @@
         if (!targetCanvas) {
           return invokeTimedOrigRender();
         }
-        const width = targetCanvas.width | 0;
-        const height = targetCanvas.height | 0;
+        const origWidth = targetCanvas.width | 0;
+        const origHeight = targetCanvas.height | 0;
+        let width = origWidth;
+        let height = origHeight;
         if (width <= 0 || height <= 0 || width > 16384 || height > 16384 || width * height > 64 * 1024 * 1024) {
           return invokeTimedOrigRender();
         }
@@ -144,20 +169,56 @@
           return invokeTimedOrigRender();
         }
 
-        const totalT = params.transform
-          ? multiply2D(params.transform, params.viewport.transform)
-          : params.viewport.transform;
-        const muMatrix = multiply2D(totalT, invBase);
-        for (let i = 0; i < 6; i++) {
-          if (!Number.isFinite(muMatrix[i])) {
-            return invokeTimedOrigRender();
-          }
-        }
-
         const pageIndex = this._pageIndex != null ? this._pageIndex : this.pageNumber - 1;
         const pageNumber = this.pageNumber;
         const includeAnnots = params.annotationMode !== 0;
         const isMainPage = !isThumb && (width > 450 || height > 450);
+
+        let totalT = params.transform
+          ? multiply2D(params.transform, params.viewport.transform)
+          : params.viewport.transform;
+
+        // Optional user-configured maxOutputScale cap (default 0 = native full HiDPI crispness).
+        // Applies only to full main-page renders (never zoomed PDFDetailView tiles or thumbnails),
+        // keeping CSS page dimensions, highlights, and textLayer coordinates 100% identical!
+        let resizedForMaxScale = false;
+        const maxOutScale = Number(cfg.maxOutputScale) || 0;
+        if (
+          maxOutScale >= 0.75 &&
+          isMainPage &&
+          !ctxAlreadyProvided &&
+          params.transform &&
+          Math.abs(params.transform[4]) < 1 &&
+          Math.abs(params.transform[5]) < 1
+        ) {
+          const curScale = Math.hypot(params.transform[0], params.transform[1]);
+          if (Number.isFinite(curScale) && curScale > maxOutScale + 0.02) {
+            const ratio = maxOutScale / curScale;
+            const newW = Math.max(1, Math.round(origWidth * ratio));
+            const newH = Math.max(1, Math.round(origHeight * ratio));
+            if (newW < origWidth && newH < origHeight) {
+              targetCanvas.width = newW;
+              targetCanvas.height = newH;
+              width = newW;
+              height = newH;
+              totalT = multiply2D([newW / origWidth, 0, 0, newH / origHeight, 0, 0], totalT);
+              resizedForMaxScale = true;
+            }
+          }
+        }
+
+        const muMatrix = multiply2D(totalT, invBase);
+        for (let i = 0; i < 6; i++) {
+          if (!Number.isFinite(muMatrix[i])) {
+            if (resizedForMaxScale) {
+              targetCanvas.width = origWidth;
+              targetCanvas.height = origHeight;
+            }
+            return invokeTimedOrigRender();
+          }
+        }
+
+        const isVisible = isMainPage ? isPageVisibleInViewer(pageNumber, pageIndex) : true;
 
         const skipBlender = !!(params.canvasContext && params.canvasContext.skipBlender);
         let theme = null;
@@ -217,6 +278,13 @@
 
         const runFallback = reason => {
           if (cancelled || settled) return;
+          if (resizedForMaxScale) {
+            try {
+              targetCanvas.width = origWidth;
+              targetCanvas.height = origHeight;
+              resizedForMaxScale = false;
+            } catch {}
+          }
           try {
             bridge.reportFallback(String(reason || "unknown"));
           } catch {}
@@ -270,6 +338,7 @@
             aaLevel: cfg.aaLevel || 8,
             theme,
             isMainPage,
+            isVisible,
             hasProvidedCtx: ctxAlreadyProvided,
           });
 
@@ -278,12 +347,13 @@
             targetCanvas,
             ctxAlreadyProvided ? params.canvasContext : null,
             () => cancelled || settled,
-            (paintMs, paintMode) => {
+            (paintMs, paintMode, yieldMs = 0) => {
               if (cancelled || settled) return;
-              const e2eMs = performance.now() - tE2EStart;
+              const activePaint = Number(paintMs) || 0;
+              const e2eMs = Math.max(activePaint, performance.now() - tE2EStart - (Number(yieldMs) || 0));
               settled = true;
               try {
-                bridge.reportMuPDFPaint?.(e2eMs, Number(paintMs) || 0, paintMode || "skia", isMainPage);
+                bridge.reportMuPDFPaint?.(e2eMs, activePaint, paintMode || "skia", isMainPage);
               } catch {}
               resolvePromise();
             },

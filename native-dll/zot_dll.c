@@ -361,6 +361,14 @@ static void pix_push_front(ZotEngine *eng, PixEntry *e) {
     eng->pix_head = e;
 }
 
+static void pix_push_back(ZotEngine *eng, PixEntry *e) {
+    e->next = NULL;
+    e->prev = eng->pix_tail;
+    if (eng->pix_tail) eng->pix_tail->next = e;
+    else eng->pix_head = e;
+    eng->pix_tail = e;
+}
+
 static int pix_exists(ZotEngine *eng, const PixKey *k) {
     AcquireSRWLockShared(&eng->pix_lock);
     PixEntry *cur = eng->pix_head;
@@ -387,9 +395,11 @@ static int pix_lookup_copy(
     PixEntry *cur = eng->pix_head;
     while (cur) {
         if (pix_key_eq(&cur->key, k)) {
-            if (cur != eng->pix_head) {
+            // Once consumed by Zotero's DOM canvas, demote to LRU tail so upcoming unconsumed
+            // background pre-renders stay protected at the front while transient redraws still hit!
+            if (cur != eng->pix_tail) {
                 pix_unlink(eng, cur);
-                pix_push_front(eng, cur);
+                pix_push_back(eng, cur);
             }
             if (out_rgba) {
                 memcpy(out_rgba, cur->rgba, cur->byte_len);
@@ -469,22 +479,6 @@ static void pix_store_take(
         free_pix_entry_meta(ev);
     }
     ReleaseSRWLockExclusive(&eng->pix_lock);
-}
-
-static void pix_store_copy(
-    ZotEngine *eng,
-    const PixKey *k,
-    const unsigned char *rgba,
-    size_t byte_len,
-    float pw,
-    float ph,
-    int page_count
-) {
-    if (!rgba || byte_len == 0 || byte_len > eng->max_pix_bytes / 2) return;
-    unsigned char *copy = pix_alloc_buf(eng, byte_len);
-    if (!copy) return;
-    memcpy(copy, rgba, byte_len);
-    pix_store_take(eng, k, copy, byte_len, pw, ph, page_count);
 }
 
 /* ---------------- Shared Display List LRU Cache (Self-Contained) ---------------- */
@@ -899,7 +893,7 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
 
 static ZotEngine *create_engine_internal(int store_mb, int pix_cache_mb, int bg_workers) {
     if (store_mb <= 0) store_mb = 96;
-    if (pix_cache_mb <= 0) pix_cache_mb = 128;
+    if (pix_cache_mb <= 0) pix_cache_mb = 96;
     if (bg_workers < 0) bg_workers = 0;
     if (bg_workers > 4) bg_workers = 4;
 
@@ -1369,9 +1363,9 @@ ZOT_EXPORT int zot_dll_render_rgba(
     }
 
     if (rc == 0) {
-        size_t nbytes = (size_t)width * (size_t)height * 4;
         if (width >= 650 || height >= 650) {
-            pix_store_copy(eng, &pk, out_rgba, nbytes, pw, ph, page_count);
+            // Skip redundant 25MB foreground pix_store_copy (Zotero DOM canvas holds this page right now!);
+            // keep pixCache dedicated to upcoming off-thread bg pre-renders (+dir, +2*dir, -dir).
             schedule_bg_prerenders(eng, path_utf8, password_utf8, mtime, fsize, page_index, page_count, width, height, pw, ph, m, pk.include_annots, aa_level, &theme);
         }
 

@@ -743,29 +743,73 @@ var ZotMuPDFReaderHook = (function () {
                 : xrayCanvas.getContext("2d", { alpha: false, willReadFrequently: useSwCanvas });
 
               // PATH 1 (Zero-copy Chrome direct putImageData onto Skia surface -> async WebRender GPU upload!)
+              // Visible pages paint in 1 shot (zero tearing); large offscreen pre-render pages (+1) paint in
+              // 4 horizontal strips (~7ms each, <1 frame) with 4ms yields so scrolling NEVER hits a 31ms jank spike!
               if (res.buf && xrayCtx) {
                 const chromeWin =
                   Services.wm.getMostRecentWindow("navigator:browser") || Services.wm.getMostRecentWindow(null);
                 if (chromeWin && typeof chromeWin.ImageData === "function") {
                   let paintedOk = false;
                   let paintMs = 0;
-                  const tPaint0 = nowMs();
+                  let yieldMs = 0;
+                  const shouldSlice =
+                    parsed.isVisible === false &&
+                    isMainPage &&
+                    res.height >= 800 &&
+                    res.width * res.height >= 1500000;
                   try {
                     const imgData = new chromeWin.ImageData(
                       new Uint8ClampedArray(res.buf),
                       res.width,
                       res.height
                     );
-                    xrayCtx.putImageData(imgData, 0, 0);
-                    paintMs = nowMs() - tPaint0;
-                    paintedOk = true;
+                    if (shouldSlice) {
+                      const STRIPS = 4;
+                      let abortedMidSlice = false;
+                      for (let s = 0; s < STRIPS; s++) {
+                        if (checkCancelled() || xrayCanvas.width !== res.width || xrayCanvas.height !== res.height) {
+                          abortedMidSlice = true;
+                          break;
+                        }
+                        const y0 = Math.floor((s * res.height) / STRIPS);
+                        const y1 = Math.floor(((s + 1) * res.height) / STRIPS);
+                        const sh = y1 - y0;
+                        if (sh > 0) {
+                          const ts0 = nowMs();
+                          xrayCtx.putImageData(imgData, 0, 0, 0, y0, res.width, sh);
+                          paintMs += nowMs() - ts0;
+                        }
+                        if (s + 1 < STRIPS) {
+                          const ty0 = nowMs();
+                          await new Promise(r => setTimeout(r, 4));
+                          yieldMs += nowMs() - ty0;
+                        }
+                      }
+                      if (abortedMidSlice || checkCancelled()) {
+                        this.engine.recycleBuffer(res.buf);
+                        return;
+                      }
+                      paintedOk = true;
+                    } else {
+                      const tPaint0 = nowMs();
+                      xrayCtx.putImageData(imgData, 0, 0);
+                      paintMs = nowMs() - tPaint0;
+                      paintedOk = true;
+                    }
                   } catch (directErr) {
                     this.engine.log("direct Chrome putImageData fallback:", directErr?.message || String(directErr));
                   }
                   if (paintedOk) {
                     this.engine.recycleBuffer(res.buf);
+                    const mode = shouldSlice
+                      ? useSwCanvas
+                        ? "skia-sliced"
+                        : "direct-sliced"
+                      : useSwCanvas
+                        ? "skia"
+                        : "direct";
                     try {
-                      onPainted(paintMs, useSwCanvas ? "skia" : "direct");
+                      onPainted(paintMs, mode, yieldMs);
                     } catch {}
                     return;
                   }
@@ -1097,11 +1141,15 @@ var ZotMuPDFReaderHook = (function () {
         const modeLabel =
           summary.paintMode === "skia"
             ? "Skia零拷贝"
-            : summary.paintMode === "direct"
-              ? "GPU零拷贝"
-              : summary.paintMode === "clone"
-                ? "克隆回退"
-                : "";
+            : summary.paintMode === "skia-sliced"
+              ? "Skia分帧"
+              : summary.paintMode === "direct"
+                ? "GPU零拷贝"
+                : summary.paintMode === "direct-sliced"
+                  ? "GPU分帧"
+                  : summary.paintMode === "clone"
+                    ? "克隆回退"
+                    : "";
         const sizeLabel =
           summary.lastWidth > 0 && summary.lastHeight > 0 ? ` ${summary.lastWidth}×${summary.lastHeight}` : "";
         const modeSuffix = modeLabel ? ` · ${modeLabel}${sizeLabel}` : "";

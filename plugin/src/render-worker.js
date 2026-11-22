@@ -150,7 +150,7 @@ function initDLL(msg) {
     ctypes.int // err_cap
   );
 
-  engHandle = fnAcquire(msg.storeMB || 96, msg.pixCacheMB || 128, msg.bgWorkers ?? 1);
+  engHandle = fnAcquire(msg.storeMB || 96, msg.pixCacheMB || 96, msg.bgWorkers ?? 1);
   if (!engHandle || engHandle.isNull()) {
     lib.close();
     lib = null;

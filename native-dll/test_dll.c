@@ -138,7 +138,7 @@ int main(void) {
         return 1;
     }
 
-    void *eng = zot_dll_engine_acquire(96, 128, 1);
+    void *eng = zot_dll_engine_acquire(96, 96, 1);
     if (!eng) {
         printf("acquire failed\n");
         if (created_main) delete_utf8_file(pdf_path);
@@ -169,7 +169,8 @@ int main(void) {
     int rc2 = zot_dll_render_rgba(eng, w, 2, pdf_path, "", 0, width, height,
                                   3.69f, 0, 0, 3.38f, 0, 0, 1, 8, 0, 0, 0, 0,
                                   rgba, stats, err, sizeof(err));
-    printf("Warm 4K HiDPI PIX hit (25.1MB direct memcpy): rc=%d, ms=%.2f, tier=%.0f\n",
+    int tier2_ok = (rc2 == 0 && (int)(stats[1] + 0.5f) == 1);
+    printf("Warm 4K HiDPI DL hit (zero redundant fg pix copy): rc=%d, ms=%.2f, tier=%.0f\n",
            rc2, stats[0], stats[1]);
 
     // Wait 300ms for low-priority background pre-render of page 2 (index 1)
@@ -178,7 +179,8 @@ int main(void) {
                                   3.69f, 0, 0, 3.38f, 0, 0, 1, 8, 0, 0, 0, 0,
                                   rgba, stats, err, sizeof(err));
     int px3 = (rc3 == 0) ? has_non_white_pixels(rgba, width, height) : 0;
-    printf("Pre-rendered 4K HiDPI next page (p2): rc=%d, px=%d, ms=%.2f, tier=%.0f\n",
+    int tier3_ok = (rc3 == 0 && (int)(stats[1] + 0.5f) == 2);
+    printf("Pre-rendered 4K HiDPI next page (p2 PIX hit): rc=%d, px=%d, ms=%.2f, tier=%.0f\n",
            rc3, px3, stats[0], stats[1]);
 
     // Test lock-free parallel rendering on 3 simultaneous foreground threads for the SAME PDF
@@ -243,5 +245,5 @@ int main(void) {
     if (created_main) delete_utf8_file(pdf_path);
     if (!del_cn_ok) delete_utf8_file(cn_path);
 
-    return (rc1 == 0 && px1 && rc2 == 0 && rc3 == 0 && px3 && rc4 == 0 && px4 && rc5 == 0 && px5 && rc6 == 0 && px6 && del_cn_ok && par_ok) ? 0 : 1;
+    return (rc1 == 0 && px1 && tier2_ok && tier3_ok && px3 && rc4 == 0 && px4 && rc5 == 0 && px5 && rc6 == 0 && px6 && del_cn_ok && par_ok) ? 0 : 1;
 }

@@ -87,7 +87,7 @@ var ZotMuPDFEngineClient = (function () {
   class EngineClient {
     constructor({ rootURI, version }) {
       this.rootURI = rootURI;
-      this.version = version || "0.7.0";
+      this.version = version || "0.7.1";
       this.dllPath = "";
       this.ctrlLib = null;
       this.ctrlEng = null;
@@ -217,10 +217,13 @@ var ZotMuPDFEngineClient = (function () {
     }
 
     getConfig() {
+      const rawMaxScale = Number(getPref("maxOutputScale", ""));
+      const maxOutputScale = Number.isFinite(rawMaxScale) && rawMaxScale >= 0.75 ? rawMaxScale : 0;
       return {
         renderThumbnails: !!getPref("renderThumbnails", true),
         aaLevel: Number(getPref("aaLevel", 8)) || 8,
         softwareCanvas: this.useSoftwareCanvas(),
+        maxOutputScale,
         debugLog: !!getPref("debugLog", false),
       };
     }
@@ -341,7 +344,7 @@ var ZotMuPDFEngineClient = (function () {
       this.dllPath = dllPath;
 
       const storeMB = Number(getPref("storeMB", 96)) || 96;
-      const pixCacheMB = Number(getPref("pixCacheMB", 128)) || 128;
+      const pixCacheMB = Number(getPref("pixCacheMB", 96)) || 96;
       const bgPref = getPref("bgWorkers", 1);
       const bgWorkers = getPref("prerender", true) ? Math.max(0, Math.min(4, Number.isFinite(Number(bgPref)) ? Number(bgPref) : 1)) : 0;
       const fgWorkers = Math.max(1, Math.min(4, Number(getPref("workers", 2)) || 2));

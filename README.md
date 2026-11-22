@@ -17,8 +17,9 @@
   - 将 `PDFRenderingQueue` 与耗时的 PDF.js 文本/批注层解析解耦，页面位图一完成立即释放队列绘制下一页，大幅减少快速翻页转圈。
   - 提前并发预热 `getPage()`，避免 Zotero 后台 `getProcessedData()` 全文扫描阻塞翻页。
 - **方向感知预渲染 & 低内存自动回收**：
-  - 最低优先级（`THREAD_PRIORITY_LOWEST`）后台预渲染线程根据滚动方向（`+1 / +2 / -1`）自动预渲染邻近页面，前台活跃时立即让步，切换文档时立刻清空旧队列，避免抢占 UI 与 GPU 合成。
-  - 精简均衡的缓存上限：`fz_display_list`（24 页）+ RGBA 位图 LRU（默认 128 MB，淘汰缓冲区智能复用不滞留旧尺寸）+ Worker 1 槽 `ArrayBuffer` 复用池（空闲 5 秒自动归零）；空闲 20 秒自动收缩原生缓存，关闭 PDF 标签页时立即释放对应缓存与文件句柄，并接入 Firefox/Zotero `memory-pressure` 低内存自动清空信号。
+  - 最低优先级（`THREAD_PRIORITY_LOWEST`）后台预渲染线程根据滚动方向（`+1 / +2 / -1`）自动预渲染邻近页面，前台活跃时立即让步，切换文档时立刻清空旧队列；前台渲染直写跳过冗余拷贝，将 `pixCache` 专用于即将翻到的预渲染页。
+  - **离屏分帧防卡顿绘制**：当前可见页单次直出（0 撕裂），屏幕外预渲染页自动拆为 4 条横带分帧写入（每条 `<8ms`），显著消除滚动过程中的主线程微卡顿。
+  - 精简均衡的缓存上限：`fz_display_list`（24 页）+ RGBA 位图 LRU（默认 96 MB，淘汰缓冲区智能复用不滞留旧尺寸）+ Worker 1 槽 `ArrayBuffer` 复用池（空闲 5 秒自动归零）；空闲 20 秒自动收缩原生缓存，关闭 PDF 标签页时立即释放对应缓存与文件句柄，并接入 Firefox/Zotero `memory-pressure` 低内存自动清空信号。
   - 实时支持通过 `fz_cookie` 立即中止已滚出视口或旧缩放倍率的未完成渲染。
 - **原生侧栏缩略图加速**：专用无锁 `zot_dll_render_thumb_rgba` 通道，多线程并行生成侧栏缩略图，复用主页面 Display List 缓存且不污染主页面位图缓存；含批注页面的缩略图自动交由 Zotero 原生覆盖层渲染。
 - **亚像素级坐标与主题对齐**：
@@ -57,9 +58,10 @@
 | `extensions.zotero-mupdf-engine.workers` | `2` | 前台 `ChromeWorker` 渲染线程数（`1`–`4`） |
 | `extensions.zotero-mupdf-engine.bgWorkers` | `1` | 最低优先级后台预渲染线程数（`0`–`4`） |
 | `extensions.zotero-mupdf-engine.storeMB` | `96` | MuPDF 内部资源存储缓存上限（MB） |
-| `extensions.zotero-mupdf-engine.pixCacheMB` | `128` | 已渲染 RGBA 位图缓存上限（MB，空闲 20 秒自动收缩） |
+| `extensions.zotero-mupdf-engine.pixCacheMB` | `96` | 后台预渲染 RGBA 位图缓存上限（MB，空闲 20 秒自动收缩） |
 | `extensions.zotero-mupdf-engine.prerender` | `true` | 是否开启方向感知后台预渲染 |
 | `extensions.zotero-mupdf-engine.softwareCanvas` | `true` | 使用 Skia 软件画布（`willReadFrequently: true`）配合 WebRender 异步上传，显著降低大位图写入主线程阻塞 |
+| `extensions.zotero-mupdf-engine.maxOutputScale` | `""` | 可选高分屏画布 DPR 上限（默认空 = 原生满分辨率；填如 `"1.5"` 可在 2K/4K 屏下再降约 40% 绘制耗时与 GPU 显存，不影响标注/选字坐标） |
 | `extensions.zotero-mupdf-engine.debugLog` | `false` | 输出详细调试日志到 Zotero Debug Output |
 
 ---

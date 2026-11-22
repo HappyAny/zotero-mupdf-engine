@@ -77,26 +77,6 @@ int zot_render_display_list(
     int err_cap
 );
 
-// Render a display list into a 3-byte RGB pixmap and fast-encode lossless PNG (zlib level=1, Z_RLE).
-// Caller must free(*out_png) with free() on success (rc == 0).
-// Returns: 0 = OK, 1 = Aborted via cookie, -1 = Error.
-int zot_render_display_list_png(
-    fz_context *ctx,
-    fz_display_list *dl,
-    ZotRect bounds,
-    const float m[6],
-    int width,
-    int height,
-    int aa_level,
-    const ZotTheme *theme,
-    fz_cookie *cookie,
-    int png_strategy,
-    unsigned char **out_png,
-    size_t *out_png_len,
-    char *err_buf,
-    int err_cap
-);
-
 // Thread-safe abort trigger on an in-flight fz_cookie.
 void zot_cookie_abort(fz_cookie *cookie);
 

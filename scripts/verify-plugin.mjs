@@ -133,13 +133,14 @@ async function verifySyntaxAndBootstrap() {
   assert(loggedErrors.length === 0, "Unexpected startup errors: " + loggedErrors.map(String).join("; "));
   assert(chromeRegistered, "chrome://zotmupdf/content/ must be registered for ChromeWorker");
   assert(typeof registeredToolbarCb === "function", "renderToolbar listener was NOT registered!");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.workers") === 2, "v0.7.0 default workers must be 2");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.bgWorkers") === 1, "v0.7.0 default bgWorkers must be 1");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.storeMB") === 96, "v0.7.0 default storeMB must be 96");
-  assert(fakePrefs.get("extensions.zotero-mupdf-engine.pixCacheMB") === 128, "v0.7.0 default pixCacheMB must be 128");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.workers") === 2, "v0.7.1 default workers must be 2");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.bgWorkers") === 1, "v0.7.1 default bgWorkers must be 1");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.storeMB") === 96, "v0.7.1 default storeMB must be 96");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.pixCacheMB") === 96, "v0.7.1 default pixCacheMB must be 96");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.maxOutputScale") === "", "v0.7.1 default maxOutputScale must be empty");
   await ctx.shutdown();
   assert(chromeDestructed, "chromeHandle.destruct() must run on shutdown");
-  console.log("[check 1] manifest.json, 5 JS files syntax, v0.7.0 lean defaults & Zotero 10 startup/shutdown OK!");
+  console.log("[check 1] manifest.json, 5 JS files syntax, v0.7.1 lean defaults & Zotero 10 startup/shutdown OK!");
 }
 
 // Exact copy of Zotero 10.0.8 pdf.mjs PageViewport constructor
@@ -278,6 +279,8 @@ async function verifyPagePatchZeroCopy() {
     },
   };
 
+  let maxOutputScale = 0;
+  let visiblePageIds = new Set([1]);
   const mockPages = [1, 2, 3, 4, 5, 6].map(id => ({ id, finished: id === 3 || id === 4 }));
   const mockDoc = new MockPDFDocumentProxy();
   const viewerApp = {
@@ -288,7 +291,11 @@ async function verifyPagePatchZeroCopy() {
     },
     eventBus,
     pdfDocument: null,
-    pdfViewer: { _pages: mockPages, update() {} },
+    pdfViewer: {
+      _pages: mockPages,
+      update() {},
+      _getVisiblePages: () => ({ ids: visiblePageIds }),
+    },
     pdfRenderingQueue: {
       isViewFinished(v) {
         return !!v.finished;
@@ -325,7 +332,7 @@ async function verifyPagePatchZeroCopy() {
     theme: null,
     __zotMuPDFBridge: {
       isEnabled: () => enabled,
-      getConfig: () => ({ renderThumbnails: true, aaLevel: 8, debugLog: false }),
+      getConfig: () => ({ renderThumbnails: true, aaLevel: 8, maxOutputScale, debugLog: false }),
       setPassword: () => {},
       cancelRequest: () => {},
       reportFallback: reason => fallbackReasons.push(reason),
@@ -379,13 +386,36 @@ async function verifyPagePatchZeroCopy() {
     },
   });
 
-  // 2a. Direct Chrome-side paint + fallback RGBA paint
+  // 2a. Direct Chrome-side paint + fallback RGBA paint + visibility & optional maxOutputScale check
   const vp = page.getViewport({ scale: 1.5 });
   const c1 = makeCanvas(Math.round(vp.width * 1.25), Math.round(vp.height * 1.25));
   await page.render({ canvas: c1, viewport: vp, transform: [1.25, 0, 0, 1.25, 0, 0], annotationMode: 1 }).promise;
   assert(lastPut && lastPut.imgData.width === c1.width && lastPut.imgData.height === c1.height, "direct paint failed");
+  assert(capturedPayloads[0].isVisible === true, "page 1 should be marked isVisible=true");
   assert(mupdfPaints.length === 1 && mupdfPaints[0].mode === "bitmap" && mupdfPaints[0].isMain === true, "reportMuPDFPaint direct failed");
   assert(origRenderCalls === 0, "origRender should not be called");
+
+  // Offscreen page 2 must report isVisible=false so reader-hook slices putImageData across frames
+  const page2 = await viewerApp.pdfDocument.getPage(2);
+  capturedPayloads.length = 0;
+  await page2.render({ canvas: makeCanvas(1600, 2200), viewport: page2.getViewport({ scale: 1.5 }), transform: [1.5, 0, 0, 1.5, 0, 0] }).promise;
+  assert(capturedPayloads[0].isVisible === false, "offscreen page 2 must be marked isVisible=false");
+
+  // Optional maxOutputScale=1.5 on a 2.0x HiDPI canvas must downscale canvas & transform proportionally
+  maxOutputScale = 1.5;
+  capturedPayloads.length = 0;
+  const cHi = makeCanvas(2000, 2800);
+  await page.render({ canvas: cHi, viewport: page.getViewport({ scale: 1.68 }), transform: [2.0, 0, 0, 2.0, 0, 0] }).promise;
+  assert(cHi.width === 1500 && cHi.height === 2100, `maxOutputScale=1.5 should resize 2000x2800 -> 1500x2100, got ${cHi.width}x${cHi.height}`);
+  assert(capturedPayloads[0].width === 1500 && capturedPayloads[0].height === 2100, "payload must carry capped dims");
+  // Fallback under maxOutputScale must restore original canvas dimensions for PDF.js
+  forceBridgeError = true;
+  const cHiFb = makeCanvas(2000, 2800);
+  await page.render({ canvas: cHiFb, viewport: page.getViewport({ scale: 1.68 }), transform: [2.0, 0, 0, 2.0, 0, 0] }).promise;
+  assert(cHiFb.width === 2000 && cHiFb.height === 2800, "fallback must restore original canvas dims");
+  forceBridgeError = false;
+  maxOutputScale = 0;
+  mupdfPaints.length = 1;
 
   useFallbackRgba = true;
   await page.render({ canvas: c1, viewport: vp, transform: [1.25, 0, 0, 1.25, 0, 0], annotationMode: 1 }).promise;
@@ -629,10 +659,164 @@ async function verifyTabCloseZeroLeak() {
   console.log("[check 4] Tab-close thumbHooks zero-leak cleanup & native evictPath verified!");
 }
 
+// 4. Verify offscreen 4-strip sliced putImageData in reader-hook.js (zero 31ms scroll jank!)
+async function verifyOffscreenSlicedPaint() {
+  let putCalls = [];
+  let recycledCount = 0;
+
+  class MockImageData {
+    constructor(data, width, height) {
+      this.data = data;
+      this.width = width;
+      this.height = height;
+    }
+  }
+
+  const fakeGlobal = {
+    Zotero: {
+      debug() {},
+      logError(e) { throw e; },
+      Prefs: { get: () => true, set() {} },
+      File: { getResourceAsync: async () => "" },
+      Reader: { _readers: [], registerEventListener() {}, async open() { return null; }, async openPreview() { return null; } },
+      Notifier: { registerObserver: () => 1, unregisterObserver() {} },
+    },
+    Services: {
+      wm: {
+        getMostRecentWindow: () => ({ ImageData: MockImageData }),
+      },
+    },
+    Components: {
+      utils: {
+        exportFunction: fn => fn,
+        cloneInto: obj => obj,
+        unwaiveXrays: obj => obj,
+      },
+    },
+    ChromeUtils: {
+      importESModule(uri) {
+        if (uri.includes("Timer.sys.mjs")) return { setTimeout, clearTimeout };
+        return {};
+      },
+      now: () => performance.now(),
+    },
+    Uint8ClampedArray,
+    Uint8Array,
+    ArrayBuffer,
+    setTimeout,
+    clearTimeout,
+    console,
+  };
+
+  const ctx = vm.createContext(fakeGlobal);
+  vm.runInContext(fs.readFileSync(path.join(PLUGIN_DIR, "src/reader-hook.js"), "utf8"), ctx, {
+    filename: "reader-hook.js",
+  });
+
+  const W = 1600;
+  const H = 2000;
+  const mockEngine = {
+    workerCount: 2,
+    isEnabled: () => true,
+    useSoftwareCanvas: () => true,
+    ensureStarted: () => Promise.resolve(),
+    getSummary: () => ({ enabled: true, ready: true, totalRenders: 0, workers: 3, fgWorkers: 2 }),
+    getConfig: () => ({ renderThumbnails: true, aaLevel: 8, softwareCanvas: true, maxOutputScale: 0 }),
+    onStatsChange: () => () => {},
+    recycleBuffer: () => { recycledCount++; },
+    renderPage: async () => ({
+      buf: new ArrayBuffer(W * H * 4),
+      width: W,
+      height: H,
+      pageW: 595,
+      pageH: 842,
+    }),
+    log() {},
+  };
+
+  const hook = new ctx.ZotMuPDFReaderHook.ReaderHook({
+    pluginID: "zotero-mupdf-engine@happyany.local",
+    rootURI: "jar:file:///test@local.xpi!/",
+    engineClient: mockEngine,
+  });
+  await hook.init();
+
+  const mockViewerWin = {
+    closed: false,
+    PDFViewerApplication: {},
+    document: {
+      head: { appendChild() {} },
+      createElement: () => ({ remove() {} }),
+    },
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const state = {
+    filePath: "C:\\temp\\test.pdf",
+    filePathPromise: Promise.resolve("C:\\temp\\test.pdf"),
+    password: "",
+    reader: {},
+    attachedWins: new WeakSet(),
+    viewerEntries: new Set(),
+    thumbHooks: new Set(),
+  };
+
+  hook._attachViewerWindow(state, mockViewerWin);
+  const bridge = mockViewerWin.__zotMuPDFBridge;
+  assert(bridge && typeof bridge.renderPage === "function", "bridge must be attached");
+
+  const mockCanvas = {
+    width: W,
+    height: H,
+    getContext: () => ({
+      putImageData(_img, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH) {
+        putCalls.push({ dx, dy, dirtyX, dirtyY, dirtyW, dirtyH });
+      },
+    }),
+  };
+
+  const result = await new Promise((resolve, reject) => {
+    bridge.renderPage(
+      JSON.stringify({
+        reqId: 1,
+        pageIndex: 1,
+        width: W,
+        height: H,
+        baseW: 595,
+        baseH: 842,
+        matrix: [2, 0, 0, 2, 0, 0],
+        includeAnnots: true,
+        aaLevel: 8,
+        theme: null,
+        isMainPage: true,
+        isVisible: false,
+      }),
+      mockCanvas,
+      null,
+      () => false,
+      (paintMs, mode, yieldMs) => resolve({ paintMs, mode, yieldMs }),
+      () => reject(new Error("unexpected fallback")),
+      err => reject(new Error(err))
+    );
+  });
+
+  assert(result.mode === "skia-sliced", "offscreen main page must use skia-sliced mode, got: " + result.mode);
+  assert(putCalls.length === 4, "offscreen paint must split into 4 strips, got: " + putCalls.length);
+  assert(putCalls[0].dirtyY === 0 && putCalls[0].dirtyH === 500, "strip 0 bounds mismatch");
+  assert(putCalls[1].dirtyY === 500 && putCalls[1].dirtyH === 500, "strip 1 bounds mismatch");
+  assert(putCalls[2].dirtyY === 1000 && putCalls[2].dirtyH === 500, "strip 2 bounds mismatch");
+  assert(putCalls[3].dirtyY === 1500 && putCalls[3].dirtyH === 500, "strip 3 bounds mismatch");
+  assert(recycledCount === 1, "ArrayBuffer must be recycled exactly once after all strips finish");
+
+  hook.shutdown();
+  console.log("[check 5] Offscreen 4-strip sliced putImageData & single buffer recycle verified!");
+}
+
 async function main() {
   await verifySyntaxAndBootstrap();
   await verifyPagePatchZeroCopy();
   await verifyTabCloseZeroLeak();
+  await verifyOffscreenSlicedPaint();
 }
 
 main().catch(err => {
