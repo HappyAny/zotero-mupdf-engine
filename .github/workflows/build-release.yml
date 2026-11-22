@@ -34,7 +34,7 @@ jobs:
           path: plugin/bin/zotero-mupdf-native-win-x64.dll
 
   build-macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

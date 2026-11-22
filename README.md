@@ -100,7 +100,7 @@ zotero-mupdf-engine/
 
 ### 自动构建通用 4 平台安装包（推荐）
 
-推送 `v*` 标签（或在 GitHub Actions 手动触发 `Build & Release Universal XPI`）后，CI 会在 **Windows x64**、**macOS Apple Silicon (`macos-14`)**、**macOS Intel (`macos-15-intel`)** 和 **Linux x64 (`ubuntu-24.04`)** 四个原生环境并行编译并运行 C 单元测试，最终自动打包并发布包含全平台原生库的单一通用 `.xpi`。
+推送 `v*` 标签（或在 GitHub Actions 手动触发 `Build & Release Universal XPI`）后，CI 会在 **Windows x64**、**macOS Apple Silicon (`macos-latest`)**、**macOS Intel (`macos-15-intel`)** 和 **Linux x64 (`ubuntu-24.04`)** 四个原生环境并行编译并运行 C 单元测试，最终自动打包并发布包含全平台原生库的单一通用 `.xpi`。
 
 ### 本地构建与验证
 
