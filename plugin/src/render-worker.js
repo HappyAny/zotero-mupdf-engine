@@ -8,25 +8,47 @@ let fnVersion = null;
 let fnAcquire = null;
 let fnRelease = null;
 let fnWorkerCreate = null;
+let fnWorkerTrim = null;
 let fnWorkerDestroy = null;
 let fnRenderRGBA = null;
 let fnRenderThumbRGBA = null;
 
-// Warm ArrayBuffer pool: eliminates Windows 4KB page-fault zero-fill storms (~10ms) and GC pauses
-// when repeatedly rendering 20-40 MB HiDPI 4K pages!
-const MAX_POOL_BUFFERS = 4;
+// Lean 1-slot warm ArrayBuffer pool per worker with 5s idle auto-purge:
+// avoids Windows 4KB page-fault storms during continuous scrolling while returning to 0 MB when idle!
+const MAX_POOL_BUFFERS = 1;
+const POOL_IDLE_MS = 5000;
 const bufferPool = [];
+let poolPurgeTimer = null;
+
+function clearPoolPurgeTimer() {
+  if (poolPurgeTimer !== null) {
+    clearTimeout(poolPurgeTimer);
+    poolPurgeTimer = null;
+  }
+}
+
+function schedulePoolPurge() {
+  clearPoolPurgeTimer();
+  if (bufferPool.length === 0) return;
+  poolPurgeTimer = setTimeout(() => {
+    poolPurgeTimer = null;
+    bufferPool.length = 0;
+  }, POOL_IDLE_MS);
+}
 
 function acquireBuffer(byteLen) {
   for (let i = bufferPool.length - 1; i >= 0; i--) {
     if (bufferPool[i].byteLength === byteLen) {
       const buf = bufferPool[i];
       bufferPool.splice(i, 1);
+      if (bufferPool.length === 0) clearPoolPurgeTimer();
       return buf;
     }
   }
-  if (bufferPool.length >= MAX_POOL_BUFFERS) {
-    bufferPool.shift();
+  // Drop stale-size pooled buffers immediately so zoom/resize never pins dead 25MB buffers
+  if (bufferPool.length > 0) {
+    bufferPool.length = 0;
+    clearPoolPurgeTimer();
   }
   return new ArrayBuffer(byteLen);
 }
@@ -34,13 +56,15 @@ function acquireBuffer(byteLen) {
 function releaseBuffer(buf) {
   if (!buf || !(buf instanceof ArrayBuffer)) return;
   const len = buf.byteLength;
-  if (len <= 0 || len > 96 * 1024 * 1024) return;
-  // Don't pool tiny thumbnail buffers so main-page HiDPI buffers stay warm in the pool
+  if (len <= 0 || len > 64 * 1024 * 1024) return;
+  // Don't pool tiny thumbnail buffers so main-page HiDPI buffer stays warm
   if (len < 1024 * 1024) return;
+  bufferPool.length = 0;
   bufferPool.push(buf);
   while (bufferPool.length > MAX_POOL_BUFFERS) {
     bufferPool.shift();
   }
+  schedulePoolPurge();
 }
 
 function parseHexRGBInt(hexStr) {
@@ -72,6 +96,7 @@ function initDLL(msg) {
   );
   fnRelease = lib.declare("zot_dll_engine_release", ctypes.default_abi, ctypes.void_t, ctypes.voidptr_t);
   fnWorkerCreate = lib.declare("zot_dll_worker_create", ctypes.default_abi, ctypes.voidptr_t, ctypes.voidptr_t);
+  fnWorkerTrim = lib.declare("zot_dll_worker_trim", ctypes.default_abi, ctypes.void_t, ctypes.voidptr_t);
   fnWorkerDestroy = lib.declare("zot_dll_worker_destroy", ctypes.default_abi, ctypes.void_t, ctypes.voidptr_t);
   fnRenderRGBA = lib.declare(
     "zot_dll_render_rgba",
@@ -125,7 +150,7 @@ function initDLL(msg) {
     ctypes.int // err_cap
   );
 
-  engHandle = fnAcquire(msg.storeMB || 256, msg.pixCacheMB || 512, msg.bgWorkers ?? 2);
+  engHandle = fnAcquire(msg.storeMB || 96, msg.pixCacheMB || 128, msg.bgWorkers ?? 1);
   if (!engHandle || engHandle.isNull()) {
     lib.close();
     lib = null;
@@ -144,6 +169,7 @@ function initDLL(msg) {
 }
 
 function shutdownDLL() {
+  clearPoolPurgeTimer();
   bufferPool.length = 0;
   try {
     if (workerHandle && fnWorkerDestroy) {
@@ -170,6 +196,17 @@ self.onmessage = function (ev) {
 
   if (msg.cmd === "recycle") {
     releaseBuffer(msg.buf);
+    return;
+  }
+
+  if (msg.cmd === "trim") {
+    clearPoolPurgeTimer();
+    bufferPool.length = 0;
+    try {
+      if (workerHandle && fnWorkerTrim) {
+        fnWorkerTrim(workerHandle);
+      }
+    } catch {}
     return;
   }
 

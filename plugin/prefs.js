@@ -1,10 +1,10 @@
 pref("extensions.zotero-mupdf-engine.enabled", true);
 pref("extensions.zotero-mupdf-engine.renderThumbnails", true);
 pref("extensions.zotero-mupdf-engine.aaLevel", 8);
-pref("extensions.zotero-mupdf-engine.workers", 3);
-pref("extensions.zotero-mupdf-engine.bgWorkers", 2);
-pref("extensions.zotero-mupdf-engine.storeMB", 256);
-pref("extensions.zotero-mupdf-engine.pixCacheMB", 512);
+pref("extensions.zotero-mupdf-engine.workers", 2);
+pref("extensions.zotero-mupdf-engine.bgWorkers", 1);
+pref("extensions.zotero-mupdf-engine.storeMB", 96);
+pref("extensions.zotero-mupdf-engine.pixCacheMB", 128);
 pref("extensions.zotero-mupdf-engine.prerender", true);
 pref("extensions.zotero-mupdf-engine.softwareCanvas", true);
 pref("extensions.zotero-mupdf-engine.debugLog", false);

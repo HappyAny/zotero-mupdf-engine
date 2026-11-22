@@ -79,11 +79,18 @@ var ZotMuPDFReaderHook = (function () {
         };
       }
 
-      // Catch session-restored or tab-selected readers via Zotero.Notifier
+      // Catch session-restored, tab-selected, and tab-closed readers via Zotero.Notifier
       this._notifierID = Zotero.Notifier.registerObserver(
         {
           notify: (event, type) => {
             if (this._destroyed) return;
+            if (type === "tab" && event === "close") {
+              this._pruneClosedReaders();
+              setTimeout(() => {
+                if (!this._destroyed) this._pruneClosedReaders();
+              }, 150);
+              return;
+            }
             if (type === "tab" && (event === "add" || event === "select")) {
               this._scanAllReaders();
               setTimeout(() => this._scanAllReaders(), 200);
@@ -115,13 +122,76 @@ var ZotMuPDFReaderHook = (function () {
 
     _scanAllReaders() {
       if (this._destroyed) return;
+      this._pruneClosedReaders();
       const list = Zotero.Reader?._readers;
       if (!Array.isArray(list)) return;
       for (const reader of list) {
-        if (reader && reader.type === "pdf" && !reader._isUninitialized) {
+        if (reader && reader.type === "pdf" && !reader._isUninitialized && !reader._isTabClosed) {
           this.attachReader(reader);
         }
       }
+    }
+
+    _pruneClosedReaders() {
+      for (const [key, state] of Array.from(this.readerStates.entries())) {
+        let dead = false;
+        try {
+          if (!state.reader || state.reader._isUninitialized || state.reader._isTabClosed) {
+            dead = true;
+          } else if (state.iframeWin && state.iframeWin.closed) {
+            dead = true;
+          }
+        } catch {
+          dead = true;
+        }
+        if (dead) {
+          this._detachReader(key);
+        }
+      }
+      for (const th of Array.from(this.thumbHooks)) {
+        try {
+          if (!th.iframeWin || th.iframeWin.closed) {
+            this._disposeThumbHook(th, false);
+          }
+        } catch {
+          this._disposeThumbHook(th, false);
+        }
+      }
+      for (const entry of Array.from(this.viewerEntries)) {
+        try {
+          if (!entry.viewerWin || entry.viewerWin.closed) {
+            this.viewerEntries.delete(entry);
+          }
+        } catch {
+          this.viewerEntries.delete(entry);
+        }
+      }
+    }
+
+    _disposeThumbHook(th, restoreOrig = true) {
+      if (!th) return;
+      this.thumbHooks.delete(th);
+      if (restoreOrig) {
+        try {
+          const alive = th.iframeWin && !th.iframeWin.closed;
+          if (alive) {
+            if (th.rawPv && th.origInitThumbnails) {
+              th.rawPv._initThumbnails = th.origInitThumbnails;
+            }
+            if (th.rawThumbs) {
+              if (th.origRender) th.rawThumbs._render = th.origRender;
+              if (th.rawThumbs._renderQueue) {
+                th.rawThumbs._renderQueue.concurrency = th.origConcurrency || 1;
+              }
+            }
+          }
+        } catch {}
+      }
+      th.rawPv = null;
+      th.origInitThumbnails = null;
+      th.rawThumbs = null;
+      th.origRender = null;
+      th.iframeWin = null;
     }
 
     attachReader(reader) {
@@ -144,6 +214,8 @@ var ZotMuPDFReaderHook = (function () {
         webViewerHandler: null,
         unloadHandler: null,
         attachedWins: new WeakSet(),
+        thumbHooks: new Set(),
+        viewerEntries: new Set(),
       };
       this.readerStates.set(key, state);
 
@@ -286,17 +358,21 @@ var ZotMuPDFReaderHook = (function () {
         const rawPv = rawInternal?._primaryView?.wrappedJSObject || rawInternal?._primaryView;
         if (!rawPv) return;
 
-        // Attach immediately if _pdfThumbnails already exists
-        if (rawPv._pdfThumbnails) {
-          this._patchThumbnailsInstance(state, rawPv, rawPv._pdfThumbnails);
-        }
-
-        // Also intercept _initThumbnails so newly created PDFThumbnails are patched before Thumbnail #1 renders!
+        // Intercept _initThumbnails first so newly created PDFThumbnails share a single hookEntry per view
+        let hookEntry = null;
         if (!this._hookedPvs.has(rawPv) && typeof rawPv._initThumbnails === "function") {
           this._hookedPvs.add(rawPv);
           const origInitThumbnails = rawPv._initThumbnails;
-          const hookEntry = { rawPv, origInitThumbnails, rawThumbs: null, origRender: null, origConcurrency: 1 };
+          hookEntry = {
+            iframeWin: state.iframeWin,
+            rawPv,
+            origInitThumbnails,
+            rawThumbs: null,
+            origRender: null,
+            origConcurrency: 1,
+          };
           this.thumbHooks.add(hookEntry);
+          state.thumbHooks.add(hookEntry);
           const self = this;
           const iframeWin = state.iframeWin;
           rawPv._initThumbnails = Cu.exportFunction(function zotMuPDFWrappedInitThumbnails() {
@@ -312,6 +388,11 @@ var ZotMuPDFReaderHook = (function () {
             }
             return ret;
           }, iframeWin);
+        }
+
+        // Attach immediately if _pdfThumbnails already exists (reusing hookEntry when present)
+        if (rawPv._pdfThumbnails) {
+          this._patchThumbnailsInstance(state, rawPv, rawPv._pdfThumbnails, hookEntry);
         }
       } catch (e) {
         this.engine.log("hookPrimaryThumbnails error:", e?.message || String(e));
@@ -329,16 +410,25 @@ var ZotMuPDFReaderHook = (function () {
       this._hookedThumbs.add(rawThumbs);
       const origRender = rawThumbs._render;
       const origConcurrency = Number(rawThumbs._renderQueue?.concurrency) || 1;
-      const entry = existingEntry || { rawPv, origInitThumbnails: null, rawThumbs: null, origRender: null, origConcurrency: 1 };
+      const entry = existingEntry || {
+        iframeWin,
+        rawPv,
+        origInitThumbnails: null,
+        rawThumbs: null,
+        origRender: null,
+        origConcurrency: 1,
+      };
+      entry.iframeWin = iframeWin;
       entry.rawThumbs = rawThumbs;
       entry.origRender = origRender;
       entry.origConcurrency = origConcurrency;
       this.thumbHooks.add(entry);
+      state.thumbHooks.add(entry);
 
-      // Parallelize Zotero's serial concurrency=1 thumbnail queue to match our 3 lock-free MuPDF workers!
+      // Match Zotero's thumbnail queue concurrency to our active lock-free foreground MuPDF workers!
       try {
         if (rawThumbs._renderQueue) {
-          rawThumbs._renderQueue.concurrency = 3;
+          rawThumbs._renderQueue.concurrency = Math.max(1, Math.min(3, this.engine.workerCount || 2));
         }
       } catch {}
 
@@ -721,11 +811,13 @@ var ZotMuPDFReaderHook = (function () {
       };
       entry.onUnload = () => {
         this.viewerEntries.delete(entry);
+        state.viewerEntries.delete(entry);
       };
       try {
         xrayWin.addEventListener("unload", entry.onUnload);
       } catch {}
       this.viewerEntries.add(entry);
+      state.viewerEntries.add(entry);
 
       try {
         if (this.engine.isEnabled() && rawWin.PDFViewerApplication?.pdfDocument) {
@@ -738,6 +830,30 @@ var ZotMuPDFReaderHook = (function () {
       const state = this.readerStates.get(key);
       if (!state) return;
       this.readerStates.delete(key);
+
+      const closedPath = state.filePath || "";
+
+      // CRITICAL: Release all thumbHooks & viewerEntries belonging to this closed tab so Gecko GC/CC
+      // immediately reclaims the closed PDFView, DOM canvases, and GPU WebRender textures!
+      if (state.thumbHooks) {
+        for (const th of Array.from(state.thumbHooks)) {
+          this._disposeThumbHook(th, true);
+        }
+        state.thumbHooks.clear();
+      }
+
+      if (state.viewerEntries) {
+        for (const entry of Array.from(state.viewerEntries)) {
+          this.viewerEntries.delete(entry);
+          try {
+            if (entry.viewerWin && !entry.viewerWin.closed && entry.onUnload) {
+              entry.viewerWin.removeEventListener("unload", entry.onUnload);
+            }
+          } catch {}
+        }
+        state.viewerEntries.clear();
+      }
+
       try {
         if (state.iframeWin && !state.iframeWin.closed) {
           if (state.webViewerHandler) {
@@ -748,6 +864,27 @@ var ZotMuPDFReaderHook = (function () {
           }
         }
       } catch {}
+
+      state.reader = null;
+      state.iframeWin = null;
+      state.webViewerHandler = null;
+      state.unloadHandler = null;
+
+      // Immediately evict native MuPDF caches & release file handles for closed PDF if no other tab uses it
+      if (closedPath && !this._destroyed) {
+        let stillOpen = false;
+        for (const other of this.readerStates.values()) {
+          if (other.filePath === closedPath) {
+            stillOpen = true;
+            break;
+          }
+        }
+        if (!stillOpen) {
+          try {
+            this.engine.evictPath?.(closedPath);
+          } catch {}
+        }
+      }
     }
 
     refreshAllViewers(coldReset = false) {
@@ -930,7 +1067,7 @@ var ZotMuPDFReaderHook = (function () {
           : "";
       const thumbLine =
         summary.thumbCount > 0
-          ? `\n侧栏缩略图加速: 已渲染 ${summary.thumbCount} 张（最近 ${fmtMs(summary.thumbLastMs)}ms · 3线程直出）`
+          ? `\n侧栏缩略图加速: 已渲染 ${summary.thumbCount} 张（最近 ${fmtMs(summary.thumbLastMs)}ms · ${summary.fgWorkers || 2}线程直出）`
           : "";
 
       if (summary.enabled) {
@@ -1037,17 +1174,7 @@ var ZotMuPDFReaderHook = (function () {
 
       // Restore Zotero's original PDFThumbnails methods & concurrency
       for (const th of Array.from(this.thumbHooks)) {
-        try {
-          if (th.rawPv && th.origInitThumbnails) {
-            th.rawPv._initThumbnails = th.origInitThumbnails;
-          }
-          if (th.rawThumbs) {
-            if (th.origRender) th.rawThumbs._render = th.origRender;
-            if (th.rawThumbs._renderQueue) {
-              th.rawThumbs._renderQueue.concurrency = th.origConcurrency || 1;
-            }
-          }
-        } catch {}
+        this._disposeThumbHook(th, true);
       }
       this.thumbHooks.clear();
 

@@ -8,11 +8,11 @@
 #include <string.h>
 #include <windows.h>
 
-#define MAX_WORKER_DOCS 6
-#define MAX_DLS 64
+#define MAX_WORKER_DOCS 2
+#define MAX_DLS 24
 #define MAX_ACTIVE_COOKIES 64
-#define BG_QUEUE_CAP 24
-#define MAX_PIX_RECYCLE 4
+#define BG_QUEUE_CAP 16
+#define MAX_PIX_RECYCLE 1
 
 /* Thread-local open document cache: each foreground ChromeWorker and each bg_worker
  * owns its own fz_document* handles -> ZERO cross-thread doc_lock, ZERO priority inversion,
@@ -309,7 +309,14 @@ static unsigned char *pix_alloc_buf(ZotEngine *eng, size_t byte_len) {
 
 static void pix_recycle_buf_locked(ZotEngine *eng, unsigned char *ptr, size_t byte_len) {
     if (!ptr) return;
-    if (byte_len >= (1u << 20) && eng->pix_recycle_count < MAX_PIX_RECYCLE) {
+    // Keep at most MAX_PIX_RECYCLE (1) buffer matching the latest working size; always drop stale-size buffers!
+    if (byte_len >= (1u << 20) && byte_len <= eng->max_pix_bytes / 2) {
+        if (eng->pix_recycle_count >= MAX_PIX_RECYCLE) {
+            free(eng->pix_recycle[0].ptr);
+            eng->pix_recycle[0].ptr = ptr;
+            eng->pix_recycle[0].byte_len = byte_len;
+            return;
+        }
         eng->pix_recycle[eng->pix_recycle_count].ptr = ptr;
         eng->pix_recycle[eng->pix_recycle_count].byte_len = byte_len;
         eng->pix_recycle_count++;
@@ -696,15 +703,15 @@ static void schedule_bg_prerenders(
     eng->last_fg_page = page_index;
     eng->last_fg_dir = dir;
 
-    // Flush stale jobs for the same PDF (old zoom dimensions or pages far from current viewport)
+    // Flush stale jobs from switched-away PDFs, old zoom dimensions, or pages far from current viewport
     int widx = 0;
     for (int i = 0; i < eng->bg_count; i++) {
         BgJob *ex = &eng->bg_queue[i];
         int stale = 0;
-        if (strcmp(ex->path, path) == 0) {
-            if (ex->width != width || ex->height != height || abs(ex->page_index - page_index) > 5) {
-                stale = 1;
-            }
+        if (strcmp(ex->path, path) != 0) {
+            stale = 1;
+        } else if (ex->width != width || ex->height != height || abs(ex->page_index - page_index) > 4) {
+            stale = 1;
         }
         if (stale) {
             free_bg_job(ex);
@@ -716,9 +723,9 @@ static void schedule_bg_prerenders(
     eng->bg_count = widx;
 
     // Insert in reverse priority order at front (index 0) so highest-priority neighbor (+dir) pops FIRST!
-    const int offsets[4] = { dir * 3, -dir, dir * 2, dir };
+    const int offsets[3] = { -dir, dir * 2, dir };
     int woke = 0;
-    for (int k = 0; k < 4; k++) {
+    for (int k = 0; k < 3; k++) {
         int tp = page_index + offsets[k];
         if (tp < 0 || (page_count > 0 && tp >= page_count)) continue;
 
@@ -781,8 +788,8 @@ static void schedule_bg_prerenders(
 
 static unsigned __stdcall bg_worker_proc(void *arg) {
     ZotEngine *eng = (ZotEngine *)arg;
-    // Below-normal priority guarantees background pre-rendering NEVER starves Zotero's UI/compositor!
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // Lowest priority guarantees background pre-rendering NEVER starves Zotero UI, WebRender, or PDF.js!
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
 
     fz_context *wctx = zot_clone_context(eng->base_ctx);
     if (!wctx) return 0;
@@ -792,14 +799,30 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
 
     for (;;) {
         BgJob job;
+        int should_clear_docs = 0;
         EnterCriticalSection(&eng->bg_cs);
         while (!eng->bg_stop && (eng->bg_count == 0 || InterlockedCompareExchange(&eng->fg_active, 0, 0) > 0)) {
-            DWORD timeout = eng->bg_count == 0 ? INFINITE : 35;
-            SleepConditionVariableCS(&eng->bg_cv, &eng->bg_cs, timeout);
+            LONG64 cur_gen = InterlockedCompareExchange64(&eng->evict_gen, 0, 0);
+            if (local_docs.count > 0 && local_docs.last_evict_gen != cur_gen) {
+                should_clear_docs = 1;
+                break;
+            }
+            DWORD timeout = eng->bg_count == 0 ? (local_docs.count > 0 ? 15000 : INFINITE) : 35;
+            BOOL ok = SleepConditionVariableCS(&eng->bg_cv, &eng->bg_cs, timeout);
+            if (!ok && GetLastError() == ERROR_TIMEOUT && eng->bg_count == 0 && local_docs.count > 0) {
+                should_clear_docs = 1;
+                break;
+            }
         }
         if (eng->bg_stop) {
             LeaveCriticalSection(&eng->bg_cs);
             break;
+        }
+        if (should_clear_docs) {
+            LeaveCriticalSection(&eng->bg_cs);
+            worker_doc_cache_clear(wctx, &local_docs);
+            local_docs.last_evict_gen = InterlockedCompareExchange64(&eng->evict_gen, 0, 0);
+            continue;
         }
         // Pop highest-priority job from index 0
         job = eng->bg_queue[0];
@@ -875,8 +898,8 @@ static unsigned __stdcall bg_worker_proc(void *arg) {
 /* ---------------- Engine Lifecycle ---------------- */
 
 static ZotEngine *create_engine_internal(int store_mb, int pix_cache_mb, int bg_workers) {
-    if (store_mb <= 0) store_mb = 256;
-    if (pix_cache_mb <= 0) pix_cache_mb = 512;
+    if (store_mb <= 0) store_mb = 96;
+    if (pix_cache_mb <= 0) pix_cache_mb = 128;
     if (bg_workers < 0) bg_workers = 0;
     if (bg_workers > 4) bg_workers = 4;
 
@@ -995,6 +1018,10 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
         free_bg_job(&eng->bg_queue[i]);
     }
     eng->bg_count = 0;
+    free(eng->last_fg_path);
+    eng->last_fg_path = NULL;
+    InterlockedIncrement64(&eng->evict_gen);
+    WakeAllConditionVariable(&eng->bg_cv);
     LeaveCriticalSection(&eng->bg_cs);
 
     AcquireSRWLockExclusive(&eng->pix_lock);
@@ -1011,8 +1038,6 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
         free_pix_entry(pe);
         pe = next;
     }
-
-    InterlockedIncrement64(&eng->evict_gen);
 
     fz_context *tmp = zot_clone_context(eng->base_ctx);
     if (!tmp) return;
@@ -1033,6 +1058,143 @@ ZOT_EXPORT void zot_dll_engine_evict(void *eng_ptr) {
     for (int i = 0; i < n_dls; i++) {
         drop_dl_unlocked(tmp, drop_dls[i]);
     }
+    zot_shrink_store(tmp, 0);
+    zot_drop_cloned_context(tmp);
+}
+
+ZOT_EXPORT void zot_dll_engine_evict_path(void *eng_ptr, const char *path_utf8) {
+    ZotEngine *eng = (ZotEngine *)eng_ptr;
+    if (!eng || !path_utf8 || !path_utf8[0]) return;
+
+    EnterCriticalSection(&eng->bg_cs);
+    int widx = 0;
+    for (int i = 0; i < eng->bg_count; i++) {
+        if (strcmp(eng->bg_queue[i].path, path_utf8) == 0) {
+            free_bg_job(&eng->bg_queue[i]);
+        } else {
+            if (widx != i) eng->bg_queue[widx] = eng->bg_queue[i];
+            widx++;
+        }
+    }
+    eng->bg_count = widx;
+    if (eng->last_fg_path && strcmp(eng->last_fg_path, path_utf8) == 0) {
+        free(eng->last_fg_path);
+        eng->last_fg_path = NULL;
+    }
+    InterlockedIncrement64(&eng->evict_gen);
+    WakeAllConditionVariable(&eng->bg_cv);
+    LeaveCriticalSection(&eng->bg_cs);
+
+    PixEntry *evicted = NULL;
+    AcquireSRWLockExclusive(&eng->pix_lock);
+    PixEntry *cur = eng->pix_head;
+    while (cur) {
+        PixEntry *next = cur->next;
+        if (cur->key.path && strcmp(cur->key.path, path_utf8) == 0) {
+            pix_unlink(eng, cur);
+            eng->pix_bytes -= cur->byte_len;
+            cur->next = evicted;
+            evicted = cur;
+        }
+        cur = next;
+    }
+    for (int i = 0; i < eng->pix_recycle_count; i++) {
+        free(eng->pix_recycle[i].ptr);
+    }
+    eng->pix_recycle_count = 0;
+    ReleaseSRWLockExclusive(&eng->pix_lock);
+
+    while (evicted) {
+        PixEntry *next = evicted->next;
+        free_pix_entry(evicted);
+        evicted = next;
+    }
+
+    DLEntry *drop_dls[MAX_DLS];
+    int n_dls = 0;
+    AcquireSRWLockExclusive(&eng->cache_lock);
+    int dl_write = 0;
+    for (int i = 0; i < eng->dl_count; i++) {
+        DLEntry *e = eng->dls[i];
+        if (e->path && strcmp(e->path, path_utf8) == 0) {
+            e->in_cache = 0;
+            e->refs--;
+            if (e->refs <= 0) drop_dls[n_dls++] = e;
+        } else {
+            eng->dls[dl_write++] = e;
+        }
+    }
+    eng->dl_count = dl_write;
+    ReleaseSRWLockExclusive(&eng->cache_lock);
+
+    fz_context *tmp = zot_clone_context(eng->base_ctx);
+    if (!tmp) return;
+    for (int i = 0; i < n_dls; i++) {
+        drop_dl_unlocked(tmp, drop_dls[i]);
+    }
+    zot_shrink_store(tmp, 50);
+    zot_drop_cloned_context(tmp);
+}
+
+ZOT_EXPORT void zot_dll_engine_trim(void *eng_ptr, int aggressive) {
+    ZotEngine *eng = (ZotEngine *)eng_ptr;
+    if (!eng) return;
+    if (aggressive) {
+        zot_dll_engine_evict(eng);
+        return;
+    }
+
+    // Soft idle trim: release recycle buffer, keep at most 2 hottest bitmaps (<=48MB) and 8 DLs, shrink store 75%
+    size_t target_pix = eng->max_pix_bytes / 3;
+    if (target_pix > (48u << 20)) target_pix = (48u << 20);
+
+    PixEntry *evicted = NULL;
+    AcquireSRWLockExclusive(&eng->pix_lock);
+    for (int i = 0; i < eng->pix_recycle_count; i++) {
+        free(eng->pix_recycle[i].ptr);
+    }
+    eng->pix_recycle_count = 0;
+
+    int count = 0;
+    for (PixEntry *p = eng->pix_head; p; p = p->next) count++;
+    while (eng->pix_tail && (count > 2 || eng->pix_bytes > target_pix)) {
+        PixEntry *ev = eng->pix_tail;
+        pix_unlink(eng, ev);
+        eng->pix_bytes -= ev->byte_len;
+        count--;
+        ev->next = evicted;
+        evicted = ev;
+    }
+    ReleaseSRWLockExclusive(&eng->pix_lock);
+
+    while (evicted) {
+        PixEntry *next = evicted->next;
+        free_pix_entry(evicted);
+        evicted = next;
+    }
+
+    DLEntry *drop_dls[MAX_DLS];
+    int n_dls = 0;
+    AcquireSRWLockExclusive(&eng->cache_lock);
+    while (eng->dl_count > 8) {
+        int victim = 0;
+        for (int i = 1; i < eng->dl_count; i++) {
+            if (eng->dls[i]->last_used < eng->dls[victim]->last_used) victim = i;
+        }
+        DLEntry *v = eng->dls[victim];
+        v->in_cache = 0;
+        v->refs--;
+        if (v->refs <= 0) drop_dls[n_dls++] = v;
+        eng->dls[victim] = eng->dls[--eng->dl_count];
+    }
+    ReleaseSRWLockExclusive(&eng->cache_lock);
+
+    fz_context *tmp = zot_clone_context(eng->base_ctx);
+    if (!tmp) return;
+    for (int i = 0; i < n_dls; i++) {
+        drop_dl_unlocked(tmp, drop_dls[i]);
+    }
+    zot_shrink_store(tmp, 25);
     zot_drop_cloned_context(tmp);
 }
 
@@ -1059,6 +1221,12 @@ ZOT_EXPORT void *zot_dll_worker_create(void *eng_ptr) {
         return NULL;
     }
     return w;
+}
+
+ZOT_EXPORT void zot_dll_worker_trim(void *worker_ptr) {
+    ZotWorker *w = (ZotWorker *)worker_ptr;
+    if (!w || !w->ctx) return;
+    worker_doc_cache_clear(w->ctx, &w->doc_cache);
 }
 
 ZOT_EXPORT void zot_dll_worker_destroy(void *worker_ptr) {

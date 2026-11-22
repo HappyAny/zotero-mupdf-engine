@@ -16,11 +16,11 @@
   - 每个前台 Worker 线程持有独立的 `WorkerDocCache`（零文档锁争用），支持同一份 PDF 多页真并行解析与光栅化。
   - 将 `PDFRenderingQueue` 与耗时的 PDF.js 文本/批注层解析解耦，页面位图一完成立即释放队列绘制下一页，大幅减少快速翻页转圈。
   - 提前并发预热 `getPage()`，避免 Zotero 后台 `getProcessedData()` 全文扫描阻塞翻页。
-- **方向感知预渲染 & 零拷贝直写**：
-  - 低优先级后台预渲染线程根据滚动方向（`+1 / +2 / +3 / -1`）自动预渲染邻近页面，前台渲染活跃时立即让步，避免抢占核心。
-  - `fz_display_list`（64 页）+ RGBA 位图 LRU（默认 512 MB，淘汰缓冲区复用避免 Windows 页错误风暴），配合 Chrome 侧 `ArrayBuffer` 复用池直写至 Skia Canvas。
+- **方向感知预渲染 & 低内存自动回收**：
+  - 最低优先级（`THREAD_PRIORITY_LOWEST`）后台预渲染线程根据滚动方向（`+1 / +2 / -1`）自动预渲染邻近页面，前台活跃时立即让步，切换文档时立刻清空旧队列，避免抢占 UI 与 GPU 合成。
+  - 精简均衡的缓存上限：`fz_display_list`（24 页）+ RGBA 位图 LRU（默认 128 MB，淘汰缓冲区智能复用不滞留旧尺寸）+ Worker 1 槽 `ArrayBuffer` 复用池（空闲 5 秒自动归零）；空闲 20 秒自动收缩原生缓存，关闭 PDF 标签页时立即释放对应缓存与文件句柄，并接入 Firefox/Zotero `memory-pressure` 低内存自动清空信号。
   - 实时支持通过 `fz_cookie` 立即中止已滚出视口或旧缩放倍率的未完成渲染。
-- **原生侧栏缩略图加速**：专用无锁 `zot_dll_render_thumb_rgba` 通道，3 线程并行生成侧栏缩略图，复用主页面 Display List 缓存且不污染主页面位图缓存；含批注页面的缩略图自动交由 Zotero 原生覆盖层渲染。
+- **原生侧栏缩略图加速**：专用无锁 `zot_dll_render_thumb_rgba` 通道，多线程并行生成侧栏缩略图，复用主页面 Display List 缓存且不污染主页面位图缓存；含批注页面的缩略图自动交由 Zotero 原生覆盖层渲染。
 - **亚像素级坐标与主题对齐**：
   - 自动换算变换矩阵 $M_{\text{MuPDF}} = T_{\text{total}} \cdot B^{-1}$，精准适配任意缩放、HiDPI `outputScale`、非零 `CropBox`、页面旋转与放大局部瓦片；发现异常边界不一致时自动无感回退 PDF.js。
   - 自动读取 Zotero 阅读器主题；在暗色/护眼主题下开启 `invertImages=false` 时，通过自定义 MuPDF `fz_device` 滤镜仅重映射文字与矢量路径颜色，保留位图插图原色。
@@ -52,12 +52,12 @@
 | 首选项键 | 默认值 | 说明 |
 |---|---|---|
 | `extensions.zotero-mupdf-engine.enabled` | `true` | 是否启用 MuPDF 渲染加速 |
-| `extensions.zotero-mupdf-engine.renderThumbnails` | `true` | 是否使用 MuPDF 3 线程加速左侧缩略图 |
+| `extensions.zotero-mupdf-engine.renderThumbnails` | `true` | 是否使用 MuPDF 多线程加速左侧缩略图 |
 | `extensions.zotero-mupdf-engine.aaLevel` | `8` | 抗锯齿等级（`0`–`8`，`8` 最清晰） |
-| `extensions.zotero-mupdf-engine.workers` | `3` | 前台 `ChromeWorker` 渲染线程数（`1`–`6`） |
-| `extensions.zotero-mupdf-engine.bgWorkers` | `2` | 后台预渲染线程数（`0`–`4`） |
-| `extensions.zotero-mupdf-engine.storeMB` | `256` | MuPDF 内部资源存储缓存上限（MB） |
-| `extensions.zotero-mupdf-engine.pixCacheMB` | `512` | 已渲染 RGBA 位图缓存上限（MB） |
+| `extensions.zotero-mupdf-engine.workers` | `2` | 前台 `ChromeWorker` 渲染线程数（`1`–`4`） |
+| `extensions.zotero-mupdf-engine.bgWorkers` | `1` | 最低优先级后台预渲染线程数（`0`–`4`） |
+| `extensions.zotero-mupdf-engine.storeMB` | `96` | MuPDF 内部资源存储缓存上限（MB） |
+| `extensions.zotero-mupdf-engine.pixCacheMB` | `128` | 已渲染 RGBA 位图缓存上限（MB，空闲 20 秒自动收缩） |
 | `extensions.zotero-mupdf-engine.prerender` | `true` | 是否开启方向感知后台预渲染 |
 | `extensions.zotero-mupdf-engine.softwareCanvas` | `true` | 使用 Skia 软件画布（`willReadFrequently: true`）配合 WebRender 异步上传，显著降低大位图写入主线程阻塞 |
 | `extensions.zotero-mupdf-engine.debugLog` | `false` | 输出详细调试日志到 Zotero Debug Output |

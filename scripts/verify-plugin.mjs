@@ -133,9 +133,13 @@ async function verifySyntaxAndBootstrap() {
   assert(loggedErrors.length === 0, "Unexpected startup errors: " + loggedErrors.map(String).join("; "));
   assert(chromeRegistered, "chrome://zotmupdf/content/ must be registered for ChromeWorker");
   assert(typeof registeredToolbarCb === "function", "renderToolbar listener was NOT registered!");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.workers") === 2, "v0.7.0 default workers must be 2");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.bgWorkers") === 1, "v0.7.0 default bgWorkers must be 1");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.storeMB") === 96, "v0.7.0 default storeMB must be 96");
+  assert(fakePrefs.get("extensions.zotero-mupdf-engine.pixCacheMB") === 128, "v0.7.0 default pixCacheMB must be 128");
   await ctx.shutdown();
   assert(chromeDestructed, "chromeHandle.destruct() must run on shutdown");
-  console.log("[check 1] manifest.json, 5 JS files syntax & Zotero 10 _loadScope startup/shutdown OK!");
+  console.log("[check 1] manifest.json, 5 JS files syntax, v0.7.0 lean defaults & Zotero 10 startup/shutdown OK!");
 }
 
 // Exact copy of Zotero 10.0.8 pdf.mjs PageViewport constructor
@@ -248,7 +252,7 @@ async function verifyPagePatchZeroCopy() {
 
   class MockPDFDocumentProxy {
     constructor() {
-      this.numPages = 5;
+      this.numPages = 20;
     }
     getPage(pageNumber) {
       getPageCalls.push(pageNumber);
@@ -388,26 +392,28 @@ async function verifyPagePatchZeroCopy() {
   assert(mupdfPaints.length === 2 && mupdfPaints[1].mode === "clone", "fallback RGBA paint failed");
   useFallbackRgba = false;
 
-  // 2a2. Queue unblocking on pagerendered + textlayerrendered timing + (+2/-1) DOM pre-render
+  // 2a2. Queue unblocking on pagerendered + textlayerrendered timing (without fighting Zotero's _trimPageBuffer!)
   eventBus.dispatch("pagerendered", { pageNumber: 1, error: null, cssTransform: false, isDetailView: false });
   await Promise.resolve();
   assert(queueKickCount === 1, "pagerendered must immediately kick pdfRenderingQueue.renderHighestPriority()");
   eventBus.dispatch("textlayerrendered", { pageNumber: 1 });
   assert(textLayerTimings.length === 1, "textlayerrendered timing must be reported");
 
-  // Page 3 is visible (finished), Page 4 (+1) is finished -> should pick Page 5 (+2) first, then Page 2 (-1)!
+  // getHighestPriority must stay untouched so Zotero's _trimPageBuffer/trimMemory never fights extra DOM canvases
   const vis3 = { first: { id: 3 }, last: { id: 3 }, views: [{ view: mockPages[2] }], ids: new Set([3]) };
-  const nextPre1 = viewerApp.pdfRenderingQueue.getHighestPriority(vis3, mockPages, true, false, false);
-  assert(nextPre1 && nextPre1.id === 5, "should pre-render +2 (page 5) when scrolling down");
-  mockPages[4].finished = true;
-  const nextPre2 = viewerApp.pdfRenderingQueue.getHighestPriority(vis3, mockPages, true, false, false);
-  assert(nextPre2 && nextPre2.id === 2, "should pre-render -1 (page 2) after +2 finishes");
+  assert(
+    viewerApp.pdfRenderingQueue.getHighestPriority(vis3, mockPages, true, false, false) === null,
+    "getHighestPriority must stay native (no +2/-1 DOM canvas bloat)"
+  );
 
-  // 2a3. getProcessedData must prefetch getPage(2..5) BEFORE calling origGetProcessedData
+  // 2a3. getProcessedData must prefetch getPage(2..6) ONLY (lean cap, not 32!) BEFORE calling origGetProcessedData
   getPageCalls.length = 0;
   await viewerApp.pdfDocument.getProcessedData();
   assert(getProcessedDataCalls === 1, "origGetProcessedData must still run");
-  assert(getPageCalls.includes(2) && getPageCalls.includes(5), "getProcessedData must prefetch getPage(2..N) ahead of scan");
+  assert(
+    getPageCalls.includes(2) && getPageCalls.includes(6) && !getPageCalls.includes(7),
+    "getProcessedData must prefetch getPage(2..6) only, got: " + getPageCalls.join(",")
+  );
 
   // 2b. Coordinate math check across rotated/cropped/zoomed-tile/UserUnit
   const testCases = [
@@ -485,12 +491,148 @@ async function verifyPagePatchZeroCopy() {
   assert(mupdfPaints.length === 1, "late PDFViewerApplication attach race must still hook PDFPageProxy.prototype.render");
   lateSandbox.__zotMuPDFControl.uninstall();
 
-  console.log("[check 3] Direct paint, fallback RGBA, +2/-1 DOM pre-render, late-attach race fix, cancel, timing, and clean uninstall ALL PASSED!");
+  console.log("[check 3] Direct paint, fallback RGBA, lean prefetch, late-attach race fix, cancel, timing, and clean uninstall ALL PASSED!");
+}
+
+// 3. Regression test: closing a PDF tab MUST release thumbHooks, viewerEntries, and evict native path cache!
+async function verifyTabCloseZeroLeak() {
+  let evictedPaths = [];
+  let notifierObs = null;
+
+  const fakeGlobal = {
+    Zotero: {
+      debug() {},
+      logError(e) { throw e; },
+      Prefs: { get: () => true, set() {} },
+      File: {
+        async getResourceAsync() {
+          return fs.readFileSync(path.join(PLUGIN_DIR, "src/page-patch.js"), "utf8");
+        },
+      },
+      Reader: {
+        _readers: [],
+        registerEventListener() {},
+        async open() { return null; },
+        async openPreview() { return null; },
+      },
+      Notifier: {
+        registerObserver(obs) {
+          notifierObs = obs;
+          return 1;
+        },
+        unregisterObserver() {},
+      },
+    },
+    Services: {
+      wm: { getMostRecentWindow: () => null },
+    },
+    Components: {
+      utils: {
+        exportFunction: fn => fn,
+        cloneInto: obj => obj,
+        unwaiveXrays: obj => obj,
+      },
+    },
+    ChromeUtils: {
+      importESModule(uri) {
+        if (uri.includes("Timer.sys.mjs")) return { setTimeout, clearTimeout };
+        return {};
+      },
+      now: () => performance.now(),
+    },
+    setTimeout,
+    clearTimeout,
+    console,
+  };
+
+  const ctx = vm.createContext(fakeGlobal);
+  vm.runInContext(fs.readFileSync(path.join(PLUGIN_DIR, "src/reader-hook.js"), "utf8"), ctx, {
+    filename: "reader-hook.js",
+  });
+
+  const mockEngine = {
+    workerCount: 2,
+    isEnabled: () => true,
+    ensureStarted: () => Promise.resolve(),
+    getSummary: () => ({ enabled: true, ready: true, totalRenders: 0, workers: 3, fgWorkers: 2 }),
+    getConfig: () => ({ renderThumbnails: true, aaLevel: 8, softwareCanvas: true }),
+    onStatsChange: () => () => {},
+    evictPath: p => evictedPaths.push(p),
+    log() {},
+  };
+
+  const hook = new ctx.ZotMuPDFReaderHook.ReaderHook({
+    pluginID: "zotero-mupdf-engine@happyany.local",
+    rootURI: "jar:file:///test@local.xpi!/",
+    engineClient: mockEngine,
+  });
+  await hook.init();
+
+  const origThumbRender = function origRender() {};
+  const origInitThumbs = function origInit() {};
+  const mockThumbs = {
+    _render: origThumbRender,
+    _renderQueue: { concurrency: 1 },
+  };
+  const mockPv = {
+    _pdfThumbnails: mockThumbs,
+    _initThumbnails: origInitThumbs,
+  };
+  let unloadCb = null;
+  const mockIframeWin = {
+    closed: false,
+    Promise,
+    document: {
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    addEventListener(ev, fn) {
+      if (ev === "unload") unloadCb = fn;
+    },
+    removeEventListener() {},
+  };
+  const mockReader = {
+    tabID: "tab-leak-test",
+    type: "pdf",
+    _isUninitialized: false,
+    _isTabClosed: false,
+    _iframeWindow: mockIframeWin,
+    _internalReader: { _primaryView: mockPv },
+    _item: { getFilePathAsync: async () => "C:\\temp\\sample.pdf" },
+  };
+
+  hook.attachReader(mockReader);
+  await new Promise(r => setTimeout(r, 30));
+
+  assert(hook.readerStates.size === 1, "readerStates should track open tab");
+  assert(hook.thumbHooks.size === 1, "thumbHooks should hook open tab thumbnails");
+  assert(mockThumbs._renderQueue.concurrency === 2, "thumbnail concurrency should match 2 fg workers");
+
+  // Simulate tab close via Zotero Notifier + _isTabClosed flag (even before unload fires!)
+  mockReader._isTabClosed = true;
+  notifierObs.notify("close", "tab");
+
+  assert(hook.readerStates.size === 0, "readerStates must be empty after tab close");
+  assert(hook.thumbHooks.size === 0, "thumbHooks MUST be empty after tab close (zero GPU/DOM leak!)");
+  assert(mockThumbs._render === origThumbRender, "original _render must be restored on detach");
+  assert(mockThumbs._renderQueue.concurrency === 1, "original concurrency must be restored on detach");
+  assert(
+    evictedPaths.length === 1 && evictedPaths[0] === "C:\\temp\\sample.pdf",
+    "evictPath must be called immediately when the last tab for that PDF closes"
+  );
+
+  // Also ensure unload firing afterward is a safe no-op
+  if (unloadCb) unloadCb();
+  hook.shutdown();
+  console.log("[check 4] Tab-close thumbHooks zero-leak cleanup & native evictPath verified!");
 }
 
 async function main() {
   await verifySyntaxAndBootstrap();
   await verifyPagePatchZeroCopy();
+  await verifyTabCloseZeroLeak();
 }
 
 main().catch(err => {

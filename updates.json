@@ -11,6 +11,16 @@
               "strict_max_version": "10.*"
             }
           }
+        },
+        {
+          "version": "0.7.0",
+          "update_link": "https://github.com/HappyAny/zotero-mupdf-engine/releases/download/v0.7.0/zotero-mupdf-engine-0.7.0.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "7.0",
+              "strict_max_version": "10.*"
+            }
+          }
         }
       ]
     }

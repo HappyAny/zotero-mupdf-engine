@@ -19,10 +19,13 @@ ZOT_EXPORT const char *zot_dll_version(void);
 ZOT_EXPORT void *zot_dll_engine_acquire(int store_mb, int pix_cache_mb, int bg_workers);
 ZOT_EXPORT void  zot_dll_engine_release(void *eng);
 ZOT_EXPORT void  zot_dll_engine_evict(void *eng);
+ZOT_EXPORT void  zot_dll_engine_evict_path(void *eng, const char *path_utf8);
+ZOT_EXPORT void  zot_dll_engine_trim(void *eng, int aggressive);
 ZOT_EXPORT void  zot_dll_engine_abort(void *eng, int req_id);
 
 // Per-ChromeWorker MuPDF cloned context (create once per worker thread, destroy on worker shutdown).
 ZOT_EXPORT void *zot_dll_worker_create(void *eng);
+ZOT_EXPORT void  zot_dll_worker_trim(void *worker);
 ZOT_EXPORT void  zot_dll_worker_destroy(void *worker);
 
 // Renders page directly into caller-allocated RGBA buffer (width * height * 4 bytes).

@@ -100,6 +100,9 @@ int zot_render_display_list_png(
 // Thread-safe abort trigger on an in-flight fz_cookie.
 void zot_cookie_abort(fz_cookie *cookie);
 
+// Shrink (or empty when percent == 0) MuPDF's internal decoded object store.
+void zot_shrink_store(fz_context *ctx, unsigned int percent);
+
 const char *zot_mupdf_version(void);
 
 #endif

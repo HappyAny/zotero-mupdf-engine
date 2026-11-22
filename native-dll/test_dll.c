@@ -138,7 +138,7 @@ int main(void) {
         return 1;
     }
 
-    void *eng = zot_dll_engine_acquire(256, 384, 2);
+    void *eng = zot_dll_engine_acquire(96, 128, 1);
     if (!eng) {
         printf("acquire failed\n");
         if (created_main) delete_utf8_file(pdf_path);
@@ -217,12 +217,31 @@ int main(void) {
     printf("Native thumbnail (240w): rc=%d, px=%d, ms=%.2f, dims=%.0fx%.0f, aspect=%.3f, err=%s\n",
            rc5, px5, tstats[0], tstats[1], tstats[2], tstats[3], err);
 
+    // Test per-path eviction + worker trim + soft/aggressive memory trim (proves clean handle/RAM release!)
+    zot_dll_engine_evict_path(eng, cn_path);
+    zot_dll_worker_trim(w);
+    Sleep(50);
+    // Verify cn_path is actually unlocked on Windows and can be deleted while engine is still running!
+    wchar_t wcn[MAX_PATH * 2];
+    int del_cn_ok = 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, cn_path, -1, wcn, (int)(sizeof(wcn) / sizeof(wcn[0]))) > 0) {
+        del_cn_ok = DeleteFileW(wcn) ? 1 : 0;
+    }
+    zot_dll_engine_trim(eng, 0);
+    zot_dll_engine_trim(eng, 1);
+    int rc6 = zot_dll_render_rgba(eng, w, 6, pdf_path, "", 0, 1200, 1600,
+                                  2.0f, 0, 0, 2.0f, 0, 0, 1, 8, 0, 0, 0, 0,
+                                  rgba, stats, err, sizeof(err));
+    int px6 = (rc6 == 0) ? has_non_white_pixels(rgba, 1200, 1600) : 0;
+    printf("Post-evict/trim re-render & unlocked delete: del_cn_ok=%d, rc=%d, px=%d, ms=%.2f, err=%s\n",
+           del_cn_ok, rc6, px6, stats[0], err);
+
     free(rgba);
     zot_dll_worker_destroy(w);
     zot_dll_engine_release(eng);
 
     if (created_main) delete_utf8_file(pdf_path);
-    delete_utf8_file(cn_path);
+    if (!del_cn_ok) delete_utf8_file(cn_path);
 
-    return (rc1 == 0 && px1 && rc2 == 0 && rc3 == 0 && px3 && rc4 == 0 && px4 && rc5 == 0 && px5 && par_ok) ? 0 : 1;
+    return (rc1 == 0 && px1 && rc2 == 0 && rc3 == 0 && px3 && rc4 == 0 && px4 && rc5 == 0 && px5 && rc6 == 0 && px6 && del_cn_ok && par_ok) ? 0 : 1;
 }

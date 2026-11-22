@@ -87,12 +87,14 @@ var ZotMuPDFEngineClient = (function () {
   class EngineClient {
     constructor({ rootURI, version }) {
       this.rootURI = rootURI;
-      this.version = version || "0.5.0";
+      this.version = version || "0.7.0";
       this.dllPath = "";
       this.ctrlLib = null;
       this.ctrlEng = null;
       this.fnCtrlRelease = null;
       this.fnCtrlEvict = null;
+      this.fnCtrlEvictPath = null;
+      this.fnCtrlTrim = null;
       this.fnCtrlAbort = null;
 
       this.workers = []; // { worker, busy, activeJobId }
@@ -103,6 +105,10 @@ var ZotMuPDFEngineClient = (function () {
       this.nextNativeReqId = 1;
       this._inFlightMain = 0;
       this._busyTimer = null;
+      this._idleTrimTimer = null;
+      this._statsEmitTimer = null;
+      this._recycleIdx = 0;
+      this._memPressureObserver = null;
 
       this.mupdfVersion = "";
       this.workerCount = 0;
@@ -158,7 +164,11 @@ var ZotMuPDFEngineClient = (function () {
       return () => this._listeners.delete(fn);
     }
 
-    _emitStats() {
+    _flushStats() {
+      if (this._statsEmitTimer) {
+        clearTimeout(this._statsEmitTimer);
+        this._statsEmitTimer = null;
+      }
       const summary = this.getSummary();
       for (const fn of this._listeners) {
         try {
@@ -167,11 +177,26 @@ var ZotMuPDFEngineClient = (function () {
       }
     }
 
+    _emitStats(immediate = false) {
+      if (immediate) {
+        this._flushStats();
+        return;
+      }
+      if (this._statsEmitTimer) return;
+      this._statsEmitTimer = setTimeout(() => {
+        this._statsEmitTimer = null;
+        if (!this.stopped) {
+          this._flushStats();
+        }
+      }, 80);
+    }
+
     getSummary() {
       return {
         enabled: this.isEnabled(),
         ready: this.isReady(),
         mupdfVersion: this.mupdfVersion,
+        fgWorkers: this.workerCount,
         workers: this.workerCount + this.bgWorkerCount,
         lastError: this.lastError,
         ...this.stats,
@@ -184,7 +209,7 @@ var ZotMuPDFEngineClient = (function () {
 
     setEnabled(val) {
       setPref("enabled", !!val);
-      this._emitStats();
+      this._emitStats(true);
     }
 
     useSoftwareCanvas() {
@@ -207,10 +232,29 @@ var ZotMuPDFEngineClient = (function () {
     recycleBuffer(buf) {
       if (this.stopped || !buf || this.workers.length === 0) return;
       try {
-        if (buf.byteLength < 1024 * 1024) return;
-        const slot = this.workers.find(s => !s.busy) || this.workers[0];
+        if (buf.byteLength < 1024 * 1024 || buf.byteLength > 64 * 1024 * 1024) return;
+        const idx = this._recycleIdx++ % this.workers.length;
+        const slot = this.workers[idx];
         slot.worker.postMessage({ cmd: "recycle", buf }, [buf]);
       } catch {}
+    }
+
+    _clearIdleTrim() {
+      if (this._idleTrimTimer) {
+        clearTimeout(this._idleTrimTimer);
+        this._idleTrimTimer = null;
+      }
+    }
+
+    _scheduleIdleTrim() {
+      if (this.stopped) return;
+      this._clearIdleTrim();
+      this._idleTrimTimer = setTimeout(() => {
+        this._idleTrimTimer = null;
+        if (!this.stopped && this._inFlightMain === 0 && this.queue.length === 0) {
+          this.trimMemory(false);
+        }
+      }, 20000);
     }
 
     async _ensureDLLExtracted() {
@@ -275,14 +319,14 @@ var ZotMuPDFEngineClient = (function () {
           this.ready = true;
           this.consecutiveFailures = 0;
           this.lastError = "";
-          this._emitStats();
+          this._emitStats(true);
         })
         .catch(err => {
           this.consecutiveFailures++;
           this.lastFailAt = Date.now();
           this.lastError = String(err?.message || err);
           Zotero.logError(err);
-          this._emitStats();
+          this._emitStats(true);
           throw err;
         })
         .finally(() => {
@@ -296,13 +340,14 @@ var ZotMuPDFEngineClient = (function () {
       const dllPath = await this._ensureDLLExtracted();
       this.dllPath = dllPath;
 
-      const storeMB = Number(getPref("storeMB", 256)) || 256;
-      const pixCacheMB = Number(getPref("pixCacheMB", 512)) || 512;
-      const bgWorkers = getPref("prerender", true) ? Math.max(0, Math.min(4, Number(getPref("bgWorkers", 2)) || 2)) : 0;
-      const fgWorkers = Math.max(1, Math.min(4, Number(getPref("workers", 3)) || 3));
+      const storeMB = Number(getPref("storeMB", 96)) || 96;
+      const pixCacheMB = Number(getPref("pixCacheMB", 128)) || 128;
+      const bgPref = getPref("bgWorkers", 1);
+      const bgWorkers = getPref("prerender", true) ? Math.max(0, Math.min(4, Number.isFinite(Number(bgPref)) ? Number(bgPref) : 1)) : 0;
+      const fgWorkers = Math.max(1, Math.min(4, Number(getPref("workers", 2)) || 2));
       this.bgWorkerCount = bgWorkers;
 
-      // Load control handle on chrome main thread for instant 0.001ms abort() & evict()
+      // Load control handle on chrome main thread for instant 0.001ms abort(), evict() & trim()
       const { ctypes } = ChromeUtils.importESModule("resource://gre/modules/ctypes.sys.mjs");
       this.ctrlLib = ctypes.open(dllPath);
       const fnVer = this.ctrlLib.declare("zot_dll_version", ctypes.default_abi, ctypes.char.ptr);
@@ -316,6 +361,20 @@ var ZotMuPDFEngineClient = (function () {
       );
       this.fnCtrlRelease = this.ctrlLib.declare("zot_dll_engine_release", ctypes.default_abi, ctypes.void_t, ctypes.voidptr_t);
       this.fnCtrlEvict = this.ctrlLib.declare("zot_dll_engine_evict", ctypes.default_abi, ctypes.void_t, ctypes.voidptr_t);
+      this.fnCtrlEvictPath = this.ctrlLib.declare(
+        "zot_dll_engine_evict_path",
+        ctypes.default_abi,
+        ctypes.void_t,
+        ctypes.voidptr_t,
+        ctypes.char.ptr
+      );
+      this.fnCtrlTrim = this.ctrlLib.declare(
+        "zot_dll_engine_trim",
+        ctypes.default_abi,
+        ctypes.void_t,
+        ctypes.voidptr_t,
+        ctypes.int
+      );
       this.fnCtrlAbort = this.ctrlLib.declare(
         "zot_dll_engine_abort",
         ctypes.default_abi,
@@ -385,8 +444,25 @@ var ZotMuPDFEngineClient = (function () {
 
       await Promise.all(initPromises);
       this.workerCount = this.workers.length;
+
+      // Hook Gecko/Zotero system memory-pressure signal so MuPDF immediately yields all rebuildable RAM!
+      if (!this._memPressureObserver && typeof Services !== "undefined" && Services.obs?.addObserver) {
+        this._memPressureObserver = {
+          observe: (_subject, topic) => {
+            if (!this.stopped && topic === "memory-pressure") {
+              this.trimMemory(true);
+            }
+          },
+        };
+        try {
+          Services.obs.addObserver(this._memPressureObserver, "memory-pressure");
+        } catch {
+          this._memPressureObserver = null;
+        }
+      }
+
       Zotero.debug(
-        `[ZotMuPDF] In-process native MuPDF ${this.mupdfVersion} ready (${this.workerCount} lock-free ChromeWorkers + ${this.bgWorkerCount} direction-aware bg threads, ${pixCacheMB}MB RGBA cache)`
+        `[ZotMuPDF] In-process native MuPDF ${this.mupdfVersion} ready (${this.workerCount} lock-free ChromeWorkers + ${this.bgWorkerCount} lowest-prio bg threads, ${pixCacheMB}MB RGBA cache, ${storeMB}MB store)`
       );
     }
 
@@ -397,7 +473,7 @@ var ZotMuPDFEngineClient = (function () {
             this._busyTimer = null;
             if (this._inFlightMain > 0 && !this.stats.busy) {
               this.stats.busy = true;
-              this._emitStats();
+              this._emitStats(true);
             }
           }, 200);
         }
@@ -408,7 +484,7 @@ var ZotMuPDFEngineClient = (function () {
         }
         if (this.stats.busy) {
           this.stats.busy = false;
-          this._emitStats();
+          this._emitStats(true);
         }
       }
     }
@@ -539,10 +615,14 @@ var ZotMuPDFEngineClient = (function () {
       }
 
       this._pumpQueue();
+      if (this.queue.length === 0 && this._inFlightMain === 0) {
+        this._scheduleIdleTrim();
+      }
     }
 
     async renderPage(reqKey, payload, { priority = 0 } = {}) {
       await this.ensureStarted();
+      this._clearIdleTrim();
 
       const jobId = this.nextJobId++;
       const nativeReqId = this.nextNativeReqId++;
@@ -577,6 +657,7 @@ var ZotMuPDFEngineClient = (function () {
 
     async renderThumb(reqKey, payload) {
       await this.ensureStarted();
+      this._clearIdleTrim();
 
       const jobId = this.nextJobId++;
       const nativeReqId = this.nextNativeReqId++;
@@ -669,9 +750,42 @@ var ZotMuPDFEngineClient = (function () {
     }
 
     async evictCache() {
+      for (const slot of this.workers) {
+        try {
+          slot.worker.postMessage({ cmd: "trim" });
+        } catch {}
+      }
       if (this.ctrlEng && this.fnCtrlEvict) {
         try {
           this.fnCtrlEvict(this.ctrlEng);
+        } catch {}
+      }
+    }
+
+    evictPath(filePath) {
+      if (this.stopped || !filePath) return;
+      for (const slot of this.workers) {
+        try {
+          slot.worker.postMessage({ cmd: "trim" });
+        } catch {}
+      }
+      if (this.ctrlEng && this.fnCtrlEvictPath) {
+        try {
+          this.fnCtrlEvictPath(this.ctrlEng, String(filePath));
+        } catch {}
+      }
+    }
+
+    trimMemory(aggressive = false) {
+      if (this.stopped) return;
+      for (const slot of this.workers) {
+        try {
+          slot.worker.postMessage({ cmd: "trim" });
+        } catch {}
+      }
+      if (this.ctrlEng && this.fnCtrlTrim) {
+        try {
+          this.fnCtrlTrim(this.ctrlEng, aggressive ? 1 : 0);
         } catch {}
       }
     }
@@ -690,6 +804,17 @@ var ZotMuPDFEngineClient = (function () {
       if (this._busyTimer) {
         clearTimeout(this._busyTimer);
         this._busyTimer = null;
+      }
+      this._clearIdleTrim();
+      if (this._statsEmitTimer) {
+        clearTimeout(this._statsEmitTimer);
+        this._statsEmitTimer = null;
+      }
+      if (this._memPressureObserver && typeof Services !== "undefined" && Services.obs?.removeObserver) {
+        try {
+          Services.obs.removeObserver(this._memPressureObserver, "memory-pressure");
+        } catch {}
+        this._memPressureObserver = null;
       }
 
       for (const job of this.pendingJobs.values()) {

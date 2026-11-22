@@ -610,6 +610,15 @@ void zot_cookie_abort(fz_cookie *cookie) {
     }
 }
 
+void zot_shrink_store(fz_context *ctx, unsigned int percent) {
+    if (!ctx) return;
+    if (percent == 0) {
+        fz_empty_store(ctx);
+    } else {
+        fz_shrink_store(ctx, percent);
+    }
+}
+
 /* ============================================================================
  * Ultra-fast lossless 24-bit RGB PNG encoder using MuPDF's statically linked zlib
  * (level=1 + Z_RLE/Z_DEFAULT_STRATEGY, filter=None): cuts 25 MB HiDPI RGBA down

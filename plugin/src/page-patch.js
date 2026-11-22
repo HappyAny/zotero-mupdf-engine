@@ -2,8 +2,9 @@
  * Hooks PDFPageProxy.prototype.render so canvas rasterization runs on in-process lock-free
  * native MuPDF DLL via ChromeWorker + direct zero-copy Skia putImageData (async WebRender GPU upload),
  * decouples PDFRenderingQueue from slow PDF.js textLayer/annotationLayer stalls,
- * pre-renders +2 ahead & -1 behind into DOM canvases (0ms smooth scroll within Zotero's keep window),
- * and prioritizes getPage() ahead of Zotero's heavy 100-page getProcessedData() scan —
+ * lets Zotero's native +1 DOM lookahead & _trimPageBuffer manage GPU/DOM canvas memory cleanly
+ * (while MuPDF's lowest-priority bg thread pre-renders +1/+2/-1 off-thread in RAM),
+ * and prioritizes initial getPage(2..6) ahead of Zotero's heavy 100-page getProcessedData() scan —
  * while preserving 100% of Zotero native highlights, text selection, links, themes, and 3rd-party plugins.
  */
 (function initZotMuPDFPagePatch() {
@@ -25,8 +26,6 @@
   let patchedDocProto = null;
   let origPageRender = null;
   let patchedPageProto = null;
-  let origGetHighestPriority = null;
-  let patchedQueue = null;
   let nextReqId = 1;
   let docLoadedListener = null;
   let pageRenderedListener = null;
@@ -374,8 +373,8 @@
           });
         };
       }
-      // Prevent Zotero's heavy 100-page GetProcessedData scan from queueing ahead of getPage(2..32)
-      // on PDF.js's single-threaded worker right when a heavy PDF opens!
+      // Prevent Zotero's heavy 100-page GetProcessedData scan from queueing ahead of initial pages (2..6)
+      // on PDF.js's single-threaded worker right when a heavy PDF opens, without over-allocating 32 pages!
       if (typeof proto.getProcessedData === "function") {
         origGetProcessedData = proto.getProcessedData;
         proto.getProcessedData = function zotMuPDFGetProcessedData() {
@@ -386,7 +385,7 @@
           const args = arguments;
           return (async () => {
             try {
-              const total = Math.min(docSelf.numPages || 0, 32);
+              const total = Math.min(docSelf.numPages || 0, 6);
               const pre = [];
               for (let p = 2; p <= total; p++) {
                 pre.push(docSelf.getPage(p).catch(() => null));
@@ -429,57 +428,6 @@
     }
   }
 
-  function hookRenderingQueue(app) {
-    const queue = app?.pdfRenderingQueue;
-    if (!queue || typeof queue.getHighestPriority !== "function" || patchedQueue === queue) {
-      return;
-    }
-    patchedQueue = queue;
-    origGetHighestPriority = queue.getHighestPriority;
-    // Extend idle DOM canvas pre-rendering to +2 ahead & -1 behind (fits strictly inside Zotero's
-    // _trimPageBuffer keepIds + PAGE_BUFFER_KEEP_RECENT=2 window -> 0ms instant scrolling!)
-    queue.getHighestPriority = function zotMuPDFGetHighestPriority(
-      visible,
-      views,
-      scrolledDown,
-      preRenderExtra = false,
-      ignoreDetailViews = false
-    ) {
-      const chosen = origGetHighestPriority.call(
-        this,
-        visible,
-        views,
-        scrolledDown,
-        preRenderExtra,
-        ignoreDetailViews
-      );
-      if (chosen || !bridge.isEnabled()) {
-        return chosen;
-      }
-      try {
-        const mainPages = window.PDFViewerApplication?.pdfViewer?._pages;
-        if (!views || views !== mainPages || !visible || !visible.first || !visible.last) {
-          return null;
-        }
-        const firstId = visible.first.id;
-        const lastId = visible.last.id;
-        // 1. Pre-render +2 in scroll direction (1-based page id -> 0-based views index: lastId+1 or firstId-3)
-        const ahead2Idx = scrolledDown ? lastId + 1 : firstId - 3;
-        const ahead2 = views[ahead2Idx];
-        if (ahead2 && !this.isViewFinished(ahead2)) {
-          return ahead2;
-        }
-        // 2. Pre-render -1 opposite scroll direction (always preserved in Zotero's keepIds!)
-        const back1Idx = scrolledDown ? firstId - 2 : lastId;
-        const back1 = views[back1Idx];
-        if (back1 && !this.isViewFinished(back1)) {
-          return back1;
-        }
-      } catch {}
-      return null;
-    };
-  }
-
   function attachToViewerApp() {
     const app = window.PDFViewerApplication;
     if (!app) return false;
@@ -499,7 +447,6 @@
     if (app.pdfDocument) {
       hookPdfDocument(app.pdfDocument);
     }
-    hookRenderingQueue(app);
 
     const bindBus = () => {
       if (!app.eventBus || docLoadedListener) return;
@@ -507,7 +454,6 @@
         if (app.pdfDocument) {
           hookPdfDocument(app.pdfDocument);
         }
-        hookRenderingQueue(app);
       };
 
       // Decouple PDFRenderingQueue from PDF.js textLayer/annotationLayer stalls:
@@ -547,7 +493,6 @@
     } else if (app.initializedPromise) {
       app.initializedPromise.then(() => {
         bindBus();
-        hookRenderingQueue(app);
         if (app.pdfDocument) {
           hookPdfDocument(app.pdfDocument);
         }
@@ -602,9 +547,6 @@
         attachRetryTimer = null;
       }
       pageRenderEndTimes.clear();
-      if (patchedQueue && origGetHighestPriority) {
-        patchedQueue.getHighestPriority = origGetHighestPriority;
-      }
       if (patchedPageProto && origPageRender) {
         patchedPageProto.render = origPageRender;
       }
@@ -628,8 +570,6 @@
         }
       }
     } catch {}
-    patchedQueue = null;
-    origGetHighestPriority = null;
     patchedPageProto = null;
     origPageRender = null;
     patchedDocProto = null;
